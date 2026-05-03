@@ -93,6 +93,9 @@ The app supports four quality tiers, tried in this order:
 
 If a track isn't available in your selected quality, the app automatically downgrades to the next available tier.
 
+> [!NOTE] DRM-protected content
+> Decoding DRM-locked tracks (HI_RES_LOSSLESS / Dolby Atmos) is **not yet implemented**. If a track is DRM-protected, the app falls back to the highest available non-DRM quality (FLAC LOSSLESS or lower).
+
 ## API Server (Standalone)
 
 The API server can also run standalone without the GUI:
