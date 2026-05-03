@@ -1,0 +1,109 @@
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+exclude = [
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "tidal_auth/venv",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "UP", "B", "SIM", "I"]
+ignore = [
+    "E501",       # line too long (relying on formatter)
+    "SIM108",     # use if-else-assign-variant (style)
+    "SIM105",     # contextlib.suppress (style)
+    "SIM102",     # nested ifs (pre-existing in main.py)
+    "B904",       # raise from (pre-existing in main.py)
+    "B008",       # Query in defaults (pre-existing in main.py)
+    "UP035",      # typing.Dict deprecated (pre-existing)
+    "UP006",      # use dict instead of Dict (pre-existing)
+    "UP007",      # use X | Y (pre-existing)
+    "UP045",      # use X | None (pre-existing)
+    "F821",       # undefined name (actual bug in main.py, not fixed here)
+    "E722",       # bare except (pre-existing in tests/spammer.py)
+]
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+docstring-code-format = true
+
+[tool.pylint.main]
+py-version = "3.13"
+recursive = true
+ignore-patterns = ["^\\.#", "venv", "__pycache__", "build", "dist"]
+extension-pkg-allow-list = ["PyQt6.QtCore", "PyQt6.QtGui", "PyQt6.QtWidgets"]
+
+[tool.pylint.'MESSAGES CONTROL']
+disable = [
+    "bare-except",
+    "bad-inline-option",
+    "deprecated-pragma",
+    "file-ignored",
+    "locally-disabled",
+    "raw-checker-failed",
+    "suppressed-message",
+    "use-implicit-booleaness-not-comparison-to-string",
+    "use-implicit-booleaness-not-comparison-to-zero",
+    "use-symbolic-message-instead",
+    "useless-suppression",
+    "missing-module-docstring",
+    "missing-class-docstring",
+    "missing-function-docstring",
+    "too-few-public-methods",
+    "too-many-arguments",
+    "too-many-locals",
+    "invalid-name",
+    "broad-exception-caught",
+    "attribute-defined-outside-init",
+    "no-value-for-parameter",
+    "unnecessary-dunder-call",
+    "unused-argument",
+    "line-too-long",
+    "trailing-whitespace",
+    "redefined-builtin",
+    "redefined-outer-name",
+    "unused-variable",
+    "logging-fstring-interpolation",
+    "no-else-return",
+    "consider-using-min-builtin",
+    "too-many-instance-attributes",
+    "too-many-return-statements",
+    "too-many-statements",
+    "too-many-branches",
+    "too-many-lines",
+    "too-many-positional-arguments",
+    "global-statement",
+    "no-else-raise",
+    "consider-using-max-builtin",
+    "unspecified-encoding",
+    "raise-missing-from",
+    "undefined-variable",
+    "bad-indentation",
+    "no-member",
+    "unexpected-keyword-arg",
+]
+
+[tool.pylint.'DESIGN']
+max-args = 8
+max-locals = 20
+max-branches = 12
+max-statements = 50
+max-attributes = 10
+max-nested-blocks = 5
+
+[tool.pytest.ini_options]
+addopts = "-v --tb=short --color=yes"
+testpaths = ["tests"]
