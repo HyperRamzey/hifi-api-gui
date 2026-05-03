@@ -16,7 +16,6 @@ A PyQt6 desktop application for downloading lossless music from Tidal, built on 
 - **Cover art embedding** -- album artwork is automatically embedded into your downloaded files
 - **Built-in API server** -- the GUI auto-starts the backend server; no separate setup needed
 - **Proxy support** -- rotate through proxies with configurable retry logic
-- **OLED pure-black theme** -- dark UI that's easy on the eyes
 
 ## Prerequisites
 
@@ -93,7 +92,7 @@ The app supports four quality tiers, tried in this order:
 
 If a track isn't available in your selected quality, the app automatically downgrades to the next available tier.
 
-> [!NOTE] DRM-protected content
+> DRM-protected content
 > Decoding DRM-locked tracks (HI_RES_LOSSLESS / Dolby Atmos) is **not yet implemented**. If a track is DRM-protected, the app falls back to the highest available non-DRM quality (FLAC LOSSLESS or lower).
 
 ## API Server (Standalone)
@@ -126,4 +125,3 @@ The server will be available at `http://localhost:8000`.
 
 - Original API: [sachinsenal0x64/hifi](https://github.com/sachinsenal0x64/hifi)
 - API server: [binimum/hifi-api](https://github.com/binimum/hifi-api)
-- GUI inspired by [qobuz-downloader](https://github.com/CarloPozzoni/qobuz-downloader)
