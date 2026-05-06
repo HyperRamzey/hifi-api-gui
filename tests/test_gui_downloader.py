@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -918,6 +919,94 @@ class TestMainWindow:
         assert item.text(1) == "Daft Punk"
         assert item.text(2) == "Discovery"
         assert item.text(3) == "4:03"
+
+    def test_deduplication_skips_duplicate_track_ids(self, qtbot: "QtBot", sample_track_data: dict):
+        """_populate_results_safe skips tracks whose IDs were already seen."""
+        from gui_downloader import MainWindow
+
+        window = MainWindow()
+        qtbot.addWidget(window)
+
+        # First page: two unique tracks (fixture id is 62397812)
+        page1 = [sample_track_data, {**sample_track_data, "id": 99, "title": "Second Track"}]
+        window._populate_results_safe(page1)
+        assert window.results_tree.topLevelItemCount() == 2
+
+        # Second page: one duplicate of first track (same id=62397812) + one new
+        page2 = [
+            {**sample_track_data, "title": "Duplicate"},
+            {**sample_track_data, "id": 100, "title": "Third Track"},
+        ]
+        window._is_load_more = True
+        window._populate_results_safe(page2)
+        # Page-by-page: tree shows only page 2's non-duplicate items
+        assert window.results_tree.topLevelItemCount() == 1
+        assert window.results_tree.topLevelItem(0).text(0) == "Third Track"
+
+    def test_page_navigation_displays_cached_page(self, qtbot: "QtBot", sample_track_data: dict):
+        """Going back to a previous page restores its cached items."""
+        from gui_downloader import MainWindow
+
+        window = MainWindow()
+        qtbot.addWidget(window)
+
+        # Simulate page 1
+        page1 = [
+            {**sample_track_data, "id": 1, "title": "Track A"},
+            {**sample_track_data, "id": 2, "title": "Track B"},
+        ]
+        window._current_page = 0
+        window._search_limit = 25
+        window._search_query = "test"
+        window._populate_results_safe(page1)
+        assert window.results_tree.topLevelItemCount() == 2
+        assert window.results_tree.topLevelItem(0).text(0) == "Track A"
+
+        # Simulate page 2
+        page2 = [
+            {**sample_track_data, "id": 3, "title": "Track C"},
+        ]
+        window._current_page = 1
+        window._is_load_more = True
+        window._populate_results_safe(page2)
+        # Page-by-page: tree shows only page 2's items
+        assert window.results_tree.topLevelItemCount() == 1
+        assert window.results_tree.topLevelItem(0).text(0) == "Track C"
+
+        # Go back to page 1 (from cache)
+        window._on_prev_page()
+        assert window._current_page == 0
+        assert window.results_tree.topLevelItemCount() == 2
+        assert window.results_tree.topLevelItem(0).text(0) == "Track A"
+        assert window.results_tree.topLevelItem(1).text(0) == "Track B"
+
+    def test_sort_indicator_updates_on_header_click(self, qtbot: "QtBot"):
+        """Clicking a result header column sets the sort indicator."""
+        from gui_downloader import MainWindow
+
+        window = MainWindow()
+        qtbot.addWidget(window)
+
+        header = window.results_tree.header()
+
+        window._on_results_header_clicked(0)  # click Track column
+        assert window._results_sort_column == 0
+        assert window._results_sort_mode == "asc"
+        assert header.sortIndicatorOrder() == Qt.SortOrder.AscendingOrder
+
+        window._on_results_header_clicked(0)  # cycle to desc
+        assert window._results_sort_column == 0
+        assert window._results_sort_mode == "desc"
+        assert header.sortIndicatorOrder() == Qt.SortOrder.DescendingOrder
+
+        window._on_results_header_clicked(0)  # cycle to relevance
+        assert window._results_sort_column == -1
+        assert window._results_sort_mode == "relevance"
+
+        window._on_results_header_clicked(1)  # click Artist column
+        assert window._results_sort_column == 1
+        assert window._results_sort_mode == "asc"
+        assert header.sortIndicatorOrder() == Qt.SortOrder.AscendingOrder
 
     def test_add_to_queue_adds_item(self, qtbot: "QtBot"):
         """_add_to_queue adds a row to the queue tree."""

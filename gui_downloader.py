@@ -135,8 +135,12 @@ class Api:
         except Exception:
             return False
 
-    def search_tracks(self, query: str, limit: int = 25) -> list[dict]:
-        r = self.session.get(f"{API_BASE}/search/", params={"s": query, "limit": limit}, timeout=15)
+    def search_tracks(self, query: str, limit: int = 25, offset: int = 0) -> list[dict]:
+        r = self.session.get(
+            f"{API_BASE}/search/",
+            params={"s": query, "limit": limit, "offset": offset},
+            timeout=15,
+        )
         r.raise_for_status()
         data = r.json()
         return data.get("data", {}).get("items", [])
@@ -423,7 +427,7 @@ class DownloadWorker(QObject):
         import shutil
 
         # Set to True to keep temp files for inspection with ffprobe/ffmpeg
-        KEEP_TEMP = True
+        KEEP_TEMP = False
 
         urls = getattr(task, "download_urls", [])
         init_url = getattr(task, "init_url", None)
@@ -666,9 +670,9 @@ class SearchWorker(QObject):
         self._query = ""
         self._limit = 50
 
-    def run(self, query: str, limit: int = 50):
+    def run(self, query: str, limit: int = 50, offset: int = 0):
         try:
-            items = self.api.search_tracks(query, limit=limit)
+            items = self.api.search_tracks(query, limit=limit, offset=offset)
             self.results_ready.emit(items)
         except Exception as e:
             self.search_error.emit(str(e))
@@ -693,6 +697,9 @@ class MainWindow(QMainWindow):
         self._search_query = ""
         self._search_offset = 0
         self._search_limit = 25
+        self._current_page = 0
+        self._result_pages: list[list[dict]] = []  # cached raw data per page
+        self._seen_track_ids: set[int] = set()  # track IDs already displayed
 
         # Search worker
         self.search_thread = QThread()
@@ -715,6 +722,7 @@ class MainWindow(QMainWindow):
         self._results_sort_mode: str = "relevance"
         self._queue_sort_column: int = -1
         self._queue_sort_mode: str = "asc"
+        self._is_load_more: bool = False
 
         self._build_ui()
         self._server_process: subprocess.Popen[str] | None = None
@@ -800,11 +808,25 @@ class MainWindow(QMainWindow):
         self.results_tree.header().sectionClicked.connect(self._on_results_header_clicked)
         results_layout.addWidget(self.results_tree)
 
-        # Load More button for pagination
-        self.load_more_btn = QPushButton("Load More")
-        self.load_more_btn.setVisible(False)
-        self.load_more_btn.clicked.connect(self._on_load_more)
-        results_layout.addWidget(self.load_more_btn)
+        # Page navigation for pagination
+        self._prev_page_btn = QPushButton("<")
+        self._prev_page_btn.setEnabled(False)
+        self._prev_page_btn.clicked.connect(self._on_prev_page)
+        self._prev_page_btn.setVisible(False)
+
+        self._page_label = QLabel("Page 1")
+        self._page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._page_label.setVisible(False)
+
+        self._next_page_btn = QPushButton(">")
+        self._next_page_btn.clicked.connect(self._on_next_page)
+        self._next_page_btn.setVisible(False)
+
+        _pagination_layout = QHBoxLayout()
+        _pagination_layout.addWidget(self._prev_page_btn)
+        _pagination_layout.addWidget(self._page_label)
+        _pagination_layout.addWidget(self._next_page_btn)
+        results_layout.addLayout(_pagination_layout)
 
         btn_layout = QHBoxLayout()
         self.add_to_queue_btn = QPushButton("Add to Queue")
@@ -1055,7 +1077,10 @@ class MainWindow(QMainWindow):
         self._search_query = query
         self._search_offset = 0
         self._search_limit = 25
-        self.load_more_btn.setVisible(False)
+        self._current_page = 0
+        self._result_pages = []
+        self._seen_track_ids.clear()
+        self._update_pagination_ui()
 
         # Reset worker with new query
         self.search_worker.api = self.api
@@ -1071,7 +1096,11 @@ class MainWindow(QMainWindow):
     def _emit_search(self):
         """Emit search in the worker's thread context."""
         log.debug("Emitting search for: %s", self.search_worker._query)
-        self.search_worker.run(self.search_worker._query, self.search_worker._limit)
+        self.search_worker.run(
+            self.search_worker._query,
+            self.search_worker._limit,
+            self._search_offset,
+        )
 
     def _do_search(self, query: str, limit: int):
         """Called in the search thread."""
@@ -1087,12 +1116,22 @@ class MainWindow(QMainWindow):
     def _populate_results_safe(self, items: list[dict]):
         """Populate results tree with search results."""
         log.debug("Populating %d search results", len(items))
+        is_load_more = self._is_load_more
+        self._is_load_more = False
+        if not is_load_more:
+            self.results_tree.clear()
+            self.result_rows.clear()
+        page_data: list[dict] = []
         for item_data in items:
+            track_id = item_data.get("id", 0)
+            if track_id in self._seen_track_ids:
+                continue
+            self._seen_track_ids.add(track_id)
+
             title = item_data.get("title", "Unknown")
             artist = item_data.get("artist", {}).get("name", "Unknown")
             album = item_data.get("album", {}).get("title", "Unknown")
             duration = item_data.get("duration", 0)
-            track_id = item_data.get("id", 0)
             min_duration = item_data.get("minDuration", "")
             audio_quality = item_data.get("audioQuality", "")
 
@@ -1121,13 +1160,34 @@ class MainWindow(QMainWindow):
             self.results_tree.addTopLevelItem(tree_item)
             self.result_rows.append(tree_item)
 
-        # Show "Load More" if we got a full page (more results may exist)
+            page_data.append(
+                {
+                    "track_id": track_id,
+                    "title": title,
+                    "artist": artist,
+                    "album": album,
+                    "duration": dur_str,
+                    "audio_quality": audio_quality,
+                }
+            )
+
+        # Cache this page's raw data for page navigation
+        while len(self._result_pages) <= self._current_page:
+            self._result_pages.append([])
+        self._result_pages[self._current_page] = page_data
+
+        # Update pagination UI
         if len(items) >= self._search_limit:
             self._search_offset += self._search_limit
             self.search_worker._limit = self._search_limit
-            self.load_more_btn.setVisible(True)
+            self._next_page_btn.setVisible(True)
         else:
-            self.load_more_btn.setVisible(False)
+            self._next_page_btn.setVisible(False)
+        self._update_pagination_ui()
+
+        # Swap display to new page after load-more (only if we have new items)
+        if is_load_more and page_data:
+            self._swap_to_new_page()
 
         # Re-sort if an active sort is in place
         if self._results_sort_column >= 0 and self._results_sort_mode != "relevance":
@@ -1156,7 +1216,25 @@ class MainWindow(QMainWindow):
         else:
             self._results_sort_column = column
             self._results_sort_mode = "asc"
+        self._update_sort_indicators()
         self._sort_results_tree()
+
+    def _update_sort_indicators(self):
+        """Set visual sort indicators on the results tree header."""
+        header = self.results_tree.header()
+        if header is None:
+            return
+        _no_order = Qt.SortOrder(0)
+        # Clear the old sort indicator first
+        if self._results_sort_column >= 0:
+            header.setSortIndicator(self._results_sort_column, _no_order)
+        if self._results_sort_mode == "relevance":
+            self._results_sort_column = -1
+        elif self._results_sort_column >= 0:
+            if self._results_sort_mode == "asc":
+                header.setSortIndicator(self._results_sort_column, Qt.SortOrder.AscendingOrder)
+            else:
+                header.setSortIndicator(self._results_sort_column, Qt.SortOrder.DescendingOrder)
 
     def _sort_results_tree(self):
         """Sort search results by current sort column and mode."""
@@ -1197,19 +1275,86 @@ class MainWindow(QMainWindow):
         for item in all_items:
             self.queue_tree.addTopLevelItem(item)
 
-    def _on_load_more(self):
+    def _on_next_page(self):
         """Load the next page of search results."""
         if not self._search_query:
             return
-        self.load_more_btn.setVisible(False)
-        self.search_worker._limit = self._search_limit
+        self._current_page += 1
+        self._search_offset = self._current_page * self._search_limit
+        self._load_page()
+
+    def _swap_to_new_page(self):
+        """Swap the tree display to the newly loaded page."""
+        self.results_tree.clear()
+        self.result_rows.clear()
+        for item_data in self._result_pages[self._current_page]:
+            tree_item = QTreeWidgetItem(
+                [
+                    item_data["title"],
+                    item_data["artist"],
+                    item_data["album"],
+                    item_data["duration"],
+                    item_data["audio_quality"],
+                ]
+            )
+            tree_item.setData(0, Qt.ItemDataRole.UserRole, item_data["track_id"])
+            self.results_tree.addTopLevelItem(tree_item)
+            self.result_rows.append(tree_item)
+        if self._results_sort_column >= 0 and self._results_sort_mode != "relevance":
+            self._sort_results_tree()
+        self._update_pagination_ui()
+
+    def _on_prev_page(self):
+        """Go back to the previous page (re-display cached items)."""
+        if self._current_page <= 0:
+            return
+        self._current_page -= 1
+        self._search_offset = self._current_page * self._search_limit
+        self._display_page(self._current_page)
+
+    def _display_page(self, page_index: int):
+        """Display the cached items for a specific page."""
+        self.results_tree.clear()
+        self.result_rows.clear()
+        for item_data in self._result_pages[page_index]:
+            tree_item = QTreeWidgetItem(
+                [
+                    item_data["title"],
+                    item_data["artist"],
+                    item_data["album"],
+                    item_data["duration"],
+                    item_data["audio_quality"],
+                ]
+            )
+            tree_item.setData(0, Qt.ItemDataRole.UserRole, item_data["track_id"])
+            self.results_tree.addTopLevelItem(tree_item)
+            self.result_rows.append(tree_item)
+        if self._results_sort_column >= 0 and self._results_sort_mode != "relevance":
+            self._sort_results_tree()
+        self._update_pagination_ui()
+
+    def _load_page(self):
+        """Fetch the next page from the API."""
+        self._is_load_more = True
+        self._next_page_btn.setEnabled(False)
         if not self.search_thread.isRunning():
             self.search_thread.start()
-        QTimer.singleShot(0, self._emit_load_more)
+        QTimer.singleShot(0, self._emit_load_page)
 
-    def _emit_load_more(self):
-        """Emit load-more in the worker's thread context."""
-        self.search_worker.run(self._search_query, self._search_limit)
+    def _emit_load_page(self):
+        """Emit page load in the worker's thread context."""
+        self.search_worker.run(
+            self._search_query,
+            self._search_limit,
+            self._search_offset,
+        )
+
+    def _update_pagination_ui(self):
+        """Update pagination button states and page label."""
+        self._prev_page_btn.setEnabled(self._current_page > 0)
+        self._prev_page_btn.setVisible(self._current_page > 0)
+        self._page_label.setText(f"Page {self._current_page + 1}")
+        self._page_label.setVisible(True)
 
     def _on_result_clicked(self, item: QTreeWidgetItem, column: int):
         """Show cover art when a result is clicked."""
@@ -1348,7 +1493,9 @@ class MainWindow(QMainWindow):
 
     def _update_stop_button(self):
         """Enable/disable Stop button based on active downloads."""
-        has_active = any(task.status in ("manifest", "downloading") for _, task in self.queue_rows)
+        has_active = any(
+            task.status in ("manifest", "downloading", "queued") for _, task in self.queue_rows
+        )
         self.stop_btn.setEnabled(has_active)
 
     def _on_task_status_changed(self):
@@ -1387,7 +1534,7 @@ class MainWindow(QMainWindow):
 
         # Update queue rows with current progress
         for tree_item, task in self.queue_rows:
-            if task.status in ("manifest", "downloading"):
+            if task.status in ("manifest", "downloading", "queued"):
                 tree_item.setText(2, f"{pct}%")
                 tree_item.setText(3, msg)
 
@@ -1428,8 +1575,8 @@ class MainWindow(QMainWindow):
             self._sequential_remaining -= 1
             if self._sequential_remaining == 0:
                 self.download_mgr.max_concurrent = self._original_max_concurrent
-        # If task not found in queue_rows, still dispatch next to prevent stall
-        if not found:
+        # Dispatch next to prevent stall (for stopped tasks or missing tasks)
+        if task.status == "stopped" or not found:
             self.download_mgr._dispatch_next()
         self._update_stop_button()
 
@@ -1464,7 +1611,7 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, title, message)
 
     def closeEvent(self, event):
-        """Save config, clean up threads, and stop the server subprocess."""
+        """Save config, clean up threads, stop the server, and remove temp folders."""
         self._save_config()
         if self.search_thread.isRunning():
             self.search_thread.quit()
@@ -1475,6 +1622,12 @@ class MainWindow(QMainWindow):
                 self._server_process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self._server_process.kill()
+        # Clean up temp download directories in the output folder
+        output_path = Path(self.output_dir)
+        if output_path.is_dir():
+            for item in output_path.iterdir():
+                if item.is_dir() and item.name.startswith(".tmp_"):
+                    shutil.rmtree(item, ignore_errors=True)
         event.accept()
 
 
