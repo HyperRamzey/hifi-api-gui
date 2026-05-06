@@ -4,6 +4,7 @@ import base64
 import json
 import logging
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -13,7 +14,7 @@ from pathlib import Path
 
 import requests
 from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtGui import QPixmap, QCloseEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -291,7 +292,7 @@ def parse_dash_mpd(mpd_xml: str) -> tuple[str | None, str | None, list[str]]:
 
     timeline = []
     for s_elem in segment_template.findall(".//mpd:S", NS):
-        duration = int(s_elem.get("d"))
+        duration = int(s_elem.get("d", "0"))
         repeats = int(s_elem.get("r", "0"))
         timeline.extend([duration] * (repeats + 1))
 
@@ -313,7 +314,7 @@ def parse_dash_mpd(mpd_xml: str) -> tuple[str | None, str | None, list[str]]:
 class DownloadWorker(QObject):
     """Worker that runs in a QThread to download tracks."""
 
-    progress = pyqtSignal(int, str)  # (percent, message)
+    progress = pyqtSignal(int, str, int)  # (percent, message, task_id)
     task_done = pyqtSignal(object)  # DownloadTask
     task_failed = pyqtSignal(object)  # DownloadTask (with error set)
 
@@ -342,7 +343,7 @@ class DownloadWorker(QObject):
 
     def _fetch_manifest(self, task: DownloadTask):
         """Fetch and decode the track manifest."""
-        self.progress.emit(5, "Fetching manifest...")
+        self.progress.emit(5, "Fetching manifest...", task.track_id)
 
         quality_order = ["FLAC_HIRES", "FLAC", "AACLC", "HEAACV1"]
         fmt = (
@@ -399,7 +400,7 @@ class DownloadWorker(QObject):
             task.download_urls = urls  # type: ignore
             task.init_url = init_url  # type: ignore
             task.audio_codec = codec  # type: ignore
-            self.progress.emit(20, f"Manifest decoded ({enc_type})")
+            self.progress.emit(20, f"Manifest decoded ({enc_type})", task.track_id)
 
             # Fetch cover art for embedding
             try:
@@ -456,14 +457,14 @@ class DownloadWorker(QObject):
 
             # Download init segment if present
             if init_url:
-                self.progress.emit(25, "Downloading init segment...")
+                self.progress.emit(25, "Downloading init segment...", task.track_id)
                 r = session.get(init_url, timeout=60)
                 r.raise_for_status()
                 with open(combined_path, "wb") as f:
                     f.write(r.content)
 
             # Download all media segments and append to combined file
-            self.progress.emit(25, "Downloading segments...")
+            self.progress.emit(25, "Downloading segments...", task.track_id)
             with open(combined_path, "ab") as f:
                 for i, url in enumerate(urls):
                     r = session.get(url, stream=True, timeout=60)
@@ -479,10 +480,11 @@ class DownloadWorker(QObject):
                     self.progress.emit(
                         min(pct, 90),
                         f"Downloading... {i + 1}/{total_segments} ({mb:.1f} MB)",
+                        task.track_id,
                     )
 
             # Single ffmpeg remux of the combined file
-            self.progress.emit(91, "Muxing with ffmpeg...")
+            self.progress.emit(91, "Muxing with ffmpeg...", task.track_id)
             result = subprocess.run(
                 [
                     "ffmpeg",
@@ -509,7 +511,7 @@ class DownloadWorker(QObject):
 
             task.progress = 100.0
             task.filepath = str(filepath)  # type: ignore
-            self.progress.emit(100, "Download complete")
+            self.progress.emit(100, "Download complete", task.track_id)
 
         finally:
             # Clean up temp directory (skip if KEEP_TEMP for debugging)
@@ -543,13 +545,12 @@ class DownloadWorker(QObject):
             ext = filepath.suffix.lower()
             if ext == ".flac":
                 from mutagen.flac import FLAC, Picture
-                from mutagen.id3 import PictureType
 
                 audio = FLAC(str(filepath))
                 audio.clear_pictures()
                 pic = Picture()
                 pic.data = cover_data
-                pic.type = PictureType.COVER_FRONT
+                pic.type = 3  # COVER_FRONT
                 pic.mime = "image/jpeg"
                 try:
                     pic.width = 1280
@@ -562,9 +563,10 @@ class DownloadWorker(QObject):
                 from mutagen.mp4 import MP4
 
                 audio = MP4(str(filepath))
-                # MP4 uses a special cover art tag
-                audio.tags["covr"] = [cover_data]
-                audio.save()
+                if audio.tags is not None:
+                    # MP4 uses a special cover art tag
+                    audio.tags["covr"] = [cover_data]
+                    audio.save()
         except Exception:
             pass  # Cover art embedding is optional
 
@@ -572,7 +574,7 @@ class DownloadWorker(QObject):
 class DownloadManager(QObject):
     """Manages download queue and worker threads."""
 
-    progress = pyqtSignal(int, str)  # (percent, message)
+    progress = pyqtSignal(int, str, int)  # (percent, message, task_id)
     task_completed = pyqtSignal(object)  # DownloadTask
     task_failed = pyqtSignal(object)  # DownloadTask
     task_status_changed = pyqtSignal()  # Emitted when any task status changes
@@ -588,22 +590,52 @@ class DownloadManager(QObject):
         self.stopped = False
 
     def add(self, task: DownloadTask):
+        log.debug(
+            "DownloadManager.add: track %d, queue_size=%d, max_concurrent=%d",
+            task.track_id,
+            len(self.queue),
+            self.max_concurrent,
+        )
         with self.queue_lock:
             self.queue.append(task)
+            log.debug("DownloadManager.add: after append, queue_size=%d", len(self.queue))
         self._dispatch_next()
 
     def _dispatch_next(self):
         """Start next download if slots available."""
+        log.debug(
+            "DownloadManager._dispatch_next: called, queue=%d, active_threads=%d, max_concurrent=%d",
+            len(self.queue),
+            len(self.active_threads),
+            self.max_concurrent,
+        )
         with self.queue_lock:
             if not self.queue:
+                log.debug("DownloadManager._dispatch_next: queue empty, returning")
                 return
             # Clean up finished threads
             self.active_threads = [(t, w) for t, w in self.active_threads if t.isRunning()]
+            log.debug(
+                "DownloadManager._dispatch_next: after cleanup, queue=%d, active_threads=%d",
+                len(self.queue),
+                len(self.active_threads),
+            )
             if len(self.active_threads) >= self.max_concurrent:
+                log.debug(
+                    "DownloadManager._dispatch_next: all slots full (%d/%d), waiting",
+                    len(self.active_threads),
+                    self.max_concurrent,
+                )
                 return
 
             task = self.queue.pop(0)
             task.status = "manifest"
+            log.debug(
+                "DownloadManager._dispatch_next: dispatched task %d (%s), queue_size=%d",
+                task.track_id,
+                task.title,
+                len(self.queue),
+            )
 
         self.task_status_changed.emit()
 
@@ -623,17 +655,31 @@ class DownloadManager(QObject):
         thread.finished.connect(worker.deleteLater)
 
         self.active_threads.append((thread, worker))
+        log.debug("DownloadManager._dispatch_next: started thread for task %d", task.track_id)
         thread.start()
 
-    def _on_worker_progress(self, pct: int, msg: str):
-        self.progress.emit(pct, msg)
+    def _on_worker_progress(self, pct: int, msg: str, task_id: int):
+        self.progress.emit(pct, msg, task_id)
 
     def _on_task_done(self, task: DownloadTask):
+        log.debug(
+            "DownloadManager._on_task_done: track %d completed, queue_size=%d, active_threads=%d",
+            task.track_id,
+            len(self.queue),
+            len(self.active_threads),
+        )
         self.task_completed.emit(task)
         self.task_status_changed.emit()
         self._dispatch_next()
 
     def _on_task_failed(self, task: DownloadTask):
+        log.debug(
+            "DownloadManager._on_task_failed: track %d, status=%s, error=%s, queue_size=%d",
+            task.track_id,
+            task.status,
+            task.error,
+            len(self.queue),
+        )
         self.task_failed.emit(task)
         self.task_status_changed.emit()
         self._dispatch_next()
@@ -664,7 +710,7 @@ class SearchWorker(QObject):
     results_ready = pyqtSignal(list)
     search_error = pyqtSignal(str)
 
-    def __init__(self, api: Api = None):
+    def __init__(self, api: Api | None = None):
         super().__init__()
         self.api = api
         self._query = ""
@@ -672,6 +718,9 @@ class SearchWorker(QObject):
 
     def run(self, query: str, limit: int = 50, offset: int = 0):
         try:
+            if self.api is None:
+                self.search_error.emit("API not initialized")
+                return
             items = self.api.search_tracks(query, limit=limit, offset=offset)
             self.results_ready.emit(items)
         except Exception as e:
@@ -698,8 +747,8 @@ class MainWindow(QMainWindow):
         self._search_offset = 0
         self._search_limit = 25
         self._current_page = 0
-        self._result_pages: list[list[dict]] = []  # cached raw data per page
         self._seen_track_ids: set[int] = set()  # track IDs already displayed
+        self._more_pages_available = True  # Whether last API call returned >= limit items
 
         # Search worker
         self.search_thread = QThread()
@@ -805,7 +854,8 @@ class MainWindow(QMainWindow):
         self.results_tree.setColumnWidth(4, 110)
         self.results_tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
         self.results_tree.itemClicked.connect(self._on_result_clicked)
-        self.results_tree.header().sectionClicked.connect(self._on_results_header_clicked)
+        if self.results_tree.header():
+            self.results_tree.header().sectionClicked.connect(self._on_results_header_clicked)  # type: ignore[union-attr]
         results_layout.addWidget(self.results_tree)
 
         # Page navigation for pagination
@@ -867,7 +917,8 @@ class MainWindow(QMainWindow):
         self.queue_tree.setColumnWidth(4, 150)
         self.queue_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.queue_tree.customContextMenuRequested.connect(self._show_queue_context_menu)
-        self.queue_tree.header().sectionClicked.connect(self._on_queue_header_clicked)
+        if self.queue_tree.header():
+            self.queue_tree.header().sectionClicked.connect(self._on_queue_header_clicked)  # type: ignore[union-attr]
         queue_layout.addWidget(self.queue_tree)
 
         queue_btn_layout = QHBoxLayout()
@@ -1050,10 +1101,11 @@ class MainWindow(QMainWindow):
     def _read_server_output(self):
         """Read server stdout line-by-line and pipe to log console."""
         try:
-            for line in self._server_process.stdout:
-                self._append_server_log(
-                    f"[server] {line}",
-                )
+            if self._server_process and self._server_process.stdout:
+                for line in self._server_process.stdout:
+                    self._append_server_log(
+                        f"[server] {line}",
+                    )
         except Exception:
             pass
         self._append_server_log("[server] Process ended")
@@ -1078,8 +1130,8 @@ class MainWindow(QMainWindow):
         self._search_offset = 0
         self._search_limit = 25
         self._current_page = 0
-        self._result_pages = []
         self._seen_track_ids.clear()
+        self._more_pages_available = True
         self._update_pagination_ui()
 
         # Reset worker with new query
@@ -1115,18 +1167,16 @@ class MainWindow(QMainWindow):
 
     def _populate_results_safe(self, items: list[dict]):
         """Populate results tree with search results."""
-        log.debug("Populating %d search results", len(items))
-        is_load_more = self._is_load_more
+        log.debug(
+            "MainWindow._populate_results_safe: page=%d, items=%d", self._current_page, len(items)
+        )
         self._is_load_more = False
-        if not is_load_more:
-            self.results_tree.clear()
-            self.result_rows.clear()
+        # Always clear tree — we fetch fresh data each time now
+        self.results_tree.clear()
+        self.result_rows.clear()
         page_data: list[dict] = []
         for item_data in items:
             track_id = item_data.get("id", 0)
-            if track_id in self._seen_track_ids:
-                continue
-            self._seen_track_ids.add(track_id)
 
             title = item_data.get("title", "Unknown")
             artist = item_data.get("artist", {}).get("name", "Unknown")
@@ -1171,23 +1221,16 @@ class MainWindow(QMainWindow):
                 }
             )
 
-        # Cache this page's raw data for page navigation
-        while len(self._result_pages) <= self._current_page:
-            self._result_pages.append([])
-        self._result_pages[self._current_page] = page_data
-
-        # Update pagination UI
-        if len(items) >= self._search_limit:
+        # Determine if more pages available
+        self._more_pages_available = len(items) >= self._search_limit
+        if self._more_pages_available:
             self._search_offset += self._search_limit
             self.search_worker._limit = self._search_limit
-            self._next_page_btn.setVisible(True)
-        else:
-            self._next_page_btn.setVisible(False)
         self._update_pagination_ui()
 
-        # Swap display to new page after load-more (only if we have new items)
-        if is_load_more and page_data:
-            self._swap_to_new_page()
+        # Repopulate tree with fetched items (always clear first)
+        if page_data:
+            self._swap_to_new_page(page_data)
 
         # Re-sort if an active sort is in place
         if self._results_sort_column >= 0 and self._results_sort_mode != "relevance":
@@ -1239,7 +1282,9 @@ class MainWindow(QMainWindow):
     def _sort_results_tree(self):
         """Sort search results by current sort column and mode."""
         all_items = [
-            self.results_tree.topLevelItem(i) for i in range(self.results_tree.topLevelItemCount())
+            item
+            for i in range(self.results_tree.topLevelItemCount())
+            if (item := self.results_tree.topLevelItem(i)) is not None
         ]
         if self._results_sort_mode == "relevance":
             return
@@ -1264,7 +1309,9 @@ class MainWindow(QMainWindow):
     def _sort_queue_tree(self):
         """Sort queue by current sort column and mode."""
         all_items = [
-            self.queue_tree.topLevelItem(i) for i in range(self.queue_tree.topLevelItemCount())
+            item
+            for i in range(self.queue_tree.topLevelItemCount())
+            if (item := self.queue_tree.topLevelItem(i)) is not None
         ]
         all_items.sort(
             key=lambda item: item.text(self._queue_sort_column),
@@ -1277,46 +1324,48 @@ class MainWindow(QMainWindow):
 
     def _on_next_page(self):
         """Load the next page of search results."""
+        log.debug(
+            "MainWindow._on_next_page: current_page=%d, offset=%d, query=%s",
+            self._current_page,
+            self._search_offset,
+            self._search_query,
+        )
         if not self._search_query:
+            log.debug("MainWindow._on_next_page: no search query, returning")
             return
         self._current_page += 1
         self._search_offset = self._current_page * self._search_limit
+        log.debug(
+            "MainWindow._on_next_page: new_page=%d, new_offset=%d",
+            self._current_page,
+            self._search_offset,
+        )
+        # Clear seen IDs so next page fetches fresh data
+        self._seen_track_ids.clear()
         self._load_page()
 
-    def _swap_to_new_page(self):
-        """Swap the tree display to the newly loaded page."""
-        self.results_tree.clear()
-        self.result_rows.clear()
-        for item_data in self._result_pages[self._current_page]:
-            tree_item = QTreeWidgetItem(
-                [
-                    item_data["title"],
-                    item_data["artist"],
-                    item_data["album"],
-                    item_data["duration"],
-                    item_data["audio_quality"],
-                ]
-            )
-            tree_item.setData(0, Qt.ItemDataRole.UserRole, item_data["track_id"])
-            self.results_tree.addTopLevelItem(tree_item)
-            self.result_rows.append(tree_item)
-        if self._results_sort_column >= 0 and self._results_sort_mode != "relevance":
-            self._sort_results_tree()
-        self._update_pagination_ui()
-
     def _on_prev_page(self):
-        """Go back to the previous page (re-display cached items)."""
+        """Go back to the previous page (refetch cached items)."""
+        log.debug("MainWindow._on_prev_page: current_page=%d", self._current_page)
         if self._current_page <= 0:
+            log.debug("MainWindow._on_prev_page: at page 0, returning")
             return
         self._current_page -= 1
         self._search_offset = self._current_page * self._search_limit
-        self._display_page(self._current_page)
+        log.debug(
+            "MainWindow._on_prev_page: new_page=%d, new_offset=%d",
+            self._current_page,
+            self._search_offset,
+        )
+        # Clear seen IDs so previous page refetches fresh data
+        self._seen_track_ids.clear()
+        self._load_page()
 
-    def _display_page(self, page_index: int):
-        """Display the cached items for a specific page."""
+    def _swap_to_new_page(self, page_data: list[dict]):
+        """Repopulate the tree with the fetched page data."""
         self.results_tree.clear()
         self.result_rows.clear()
-        for item_data in self._result_pages[page_index]:
+        for item_data in page_data:
             tree_item = QTreeWidgetItem(
                 [
                     item_data["title"],
@@ -1335,14 +1384,35 @@ class MainWindow(QMainWindow):
 
     def _load_page(self):
         """Fetch the next page from the API."""
+        log.debug(
+            "MainWindow._load_page: page %d, offset=%d, is_load_more=%s",
+            self._current_page,
+            self._search_offset,
+            self._is_load_more,
+        )
         self._is_load_more = True
         self._next_page_btn.setEnabled(False)
         if not self.search_thread.isRunning():
+            log.debug("MainWindow._load_page: starting search thread")
             self.search_thread.start()
+        else:
+            log.debug("MainWindow._load_page: search thread already running")
         QTimer.singleShot(0, self._emit_load_page)
 
     def _emit_load_page(self):
         """Emit page load in the worker's thread context."""
+        log.debug(
+            "MainWindow._emit_load_page: query=%s, limit=%d, offset=%d",
+            self._search_query,
+            self._search_limit,
+            self._search_offset,
+        )
+        log.debug(
+            "MainWindow._emit_load_page: worker query=%s, worker limit=%d, worker offset=%d",
+            self.search_worker._query,
+            self.search_worker._limit,
+            self._search_offset,
+        )
         self.search_worker.run(
             self._search_query,
             self._search_limit,
@@ -1351,10 +1421,24 @@ class MainWindow(QMainWindow):
 
     def _update_pagination_ui(self):
         """Update pagination button states and page label."""
+        log.debug(
+            "MainWindow._update_pagination_ui: page=%d, more_pages=%s",
+            self._current_page,
+            self._more_pages_available,
+        )
         self._prev_page_btn.setEnabled(self._current_page > 0)
         self._prev_page_btn.setVisible(self._current_page > 0)
         self._page_label.setText(f"Page {self._current_page + 1}")
         self._page_label.setVisible(True)
+        self._next_page_btn.setVisible(self._more_pages_available)
+        self._next_page_btn.setEnabled(self._more_pages_available)
+        log.debug(
+            "MainWindow._update_pagination_ui: next_btn_visible=%s, next_btn_enabled=%s, prev_btn_visible=%s, prev_btn_enabled=%s",
+            self._next_page_btn.isVisible(),
+            self._next_page_btn.isEnabled(),
+            self._prev_page_btn.isVisible(),
+            self._prev_page_btn.isEnabled(),
+        )
 
     def _on_result_clicked(self, item: QTreeWidgetItem, column: int):
         """Show cover art when a result is clicked."""
@@ -1380,28 +1464,41 @@ class MainWindow(QMainWindow):
 
     def on_download(self):
         """Add selected tracks to queue and start downloading immediately."""
+        log.debug(
+            "MainWindow.on_download: clicked, %d items selected",
+            len(self.results_tree.selectedItems()),
+        )
         selected = self.results_tree.selectedItems()
         if not selected:
+            log.debug("MainWindow.on_download: no selection")
             QMessageBox.information(self, "No Selection", "Select one or more tracks to download.")
             return
 
         # Queue selected tracks first
         queued_ids = {task.track_id for _, task in self.queue_rows}
+        log.debug("MainWindow.on_download: queued_ids=%s", queued_ids)
         for item in selected:
             track_id = item.data(0, Qt.ItemDataRole.UserRole)
             if track_id in queued_ids:
+                log.debug("MainWindow.on_download: skipping already queued track %d", track_id)
                 continue
             task = self.task_map.get(track_id)
             if not task:
+                log.debug("MainWindow.on_download: no task for track_id %d", track_id)
                 continue
             task.status = "queued"
             task.quality = self.quality
             self._add_to_queue(task, item)
             queued_ids.add(track_id)
+            log.debug("MainWindow.on_download: queued track %d (%s)", track_id, task.title)
 
         # Start downloading immediately
         queued_tasks = [task for _, task in self.queue_rows if task.status == "queued"]
+        log.debug(
+            "MainWindow.on_download: %d tasks in queue, starting downloads", len(queued_tasks)
+        )
         for task in queued_tasks:
+            log.debug("MainWindow.on_download: dispatching task %d (%s)", task.track_id, task.title)
             self.download_mgr.add(task)
 
     def _add_to_queue(self, task: DownloadTask, source_item: QTreeWidgetItem):
@@ -1422,20 +1519,28 @@ class MainWindow(QMainWindow):
 
     def _queue_selected(self):
         """Add selected search results to the queue without starting downloads."""
+        log.debug(
+            "MainWindow._queue_selected: clicked, %d items selected",
+            len(self.results_tree.selectedItems()),
+        )
         selected = self.results_tree.selectedItems()
         if not selected:
+            log.debug("MainWindow._queue_selected: no selection")
             QMessageBox.information(self, "No Selection", "Select one or more tracks to queue.")
             return
 
         queued_ids = {task.track_id for _, task in self.queue_rows}
         added_count = 0
+        log.debug("MainWindow._queue_selected: existing queued_ids=%s", queued_ids)
 
         for item in selected:
             track_id = item.data(0, Qt.ItemDataRole.UserRole)
             if track_id in queued_ids:
+                log.debug("MainWindow._queue_selected: track %d already queued, skipping", track_id)
                 continue
             task = self.task_map.get(track_id)
             if not task:
+                log.debug("MainWindow._queue_selected: no task for track_id %d", track_id)
                 continue
 
             task.status = "queued"
@@ -1443,8 +1548,10 @@ class MainWindow(QMainWindow):
             self._add_to_queue(task, item)
             queued_ids.add(track_id)
             added_count += 1
+            log.debug("MainWindow._queue_selected: queued track %d (%s)", track_id, task.title)
 
         if added_count == 0:
+            log.debug("MainWindow._queue_selected: no new tracks queued")
             QMessageBox.information(
                 self, "All Queued", "All selected tracks are already in the queue."
             )
@@ -1474,16 +1581,29 @@ class MainWindow(QMainWindow):
 
     def on_download_all(self):
         """Download all queued items sequentially (1 thread)."""
+        log.debug("MainWindow.on_download_all: clicked")
         queued_tasks = [task for _, task in self.queue_rows if task.status == "queued"]
+        log.debug("MainWindow.on_download_all: %d queued tasks found", len(queued_tasks))
         if not queued_tasks:
+            log.debug("MainWindow.on_download_all: no queued tasks, showing message")
             QMessageBox.information(self, "Nothing to Download", "No queued items to download.")
             return
 
+        # Cancel any active downloads before starting sequential batch
+        self.download_mgr.stop_all()
+        log.debug(
+            "MainWindow.on_download_all: setting max_concurrent=1, remaining=%d", len(queued_tasks)
+        )
         self.download_mgr.stopped = False
         self.download_mgr.max_concurrent = 1
         self._sequential_remaining = len(queued_tasks)
 
         for task in queued_tasks:
+            log.debug(
+                "MainWindow.on_download_all: adding task %d (%s) to download_mgr",
+                task.track_id,
+                task.title,
+            )
             self.download_mgr.add(task)
 
     def on_stop_downloads(self):
@@ -1500,6 +1620,8 @@ class MainWindow(QMainWindow):
 
     def _on_task_status_changed(self):
         """React to any task status change (from DownloadManager signal)."""
+        statuses = [t.status for _, t in self.queue_rows]
+        log.debug("MainWindow._on_task_status_changed: queue statuses = %s", statuses)
         self._update_stop_button()
 
     def _show_queue_context_menu(self, position):
@@ -1512,7 +1634,11 @@ class MainWindow(QMainWindow):
             if tree_item == item:
                 menu = QMenu(self)
                 remove_action = menu.addAction("Remove")
-                action = menu.exec(self.queue_tree.viewport().mapToGlobal(position))
+                vp = self.queue_tree.viewport()
+                if vp:
+                    action = menu.exec(vp.mapToGlobal(position))
+                else:
+                    action = menu.exec(self.queue_tree.mapToGlobal(position))
                 if action == remove_action:
                     self._remove_from_queue(task, tree_item)
                 break
@@ -1528,18 +1654,25 @@ class MainWindow(QMainWindow):
 
         task.status = "removed"
 
-    def on_download_progress(self, pct: int, msg: str):
+    def on_download_progress(self, pct: int, msg: str, task_id: int):
         """Called from DownloadWorker via signal."""
         self.download_progress.setValue(pct)
 
-        # Update queue rows with current progress
+        # Update queue rows for the active task only
         for tree_item, task in self.queue_rows:
-            if task.status in ("manifest", "downloading", "queued"):
+            if task.track_id == task_id and task.status in ("manifest", "downloading", "queued"):
                 tree_item.setText(2, f"{pct}%")
                 tree_item.setText(3, msg)
+                break
 
     def _on_task_completed(self, task: DownloadTask):
         """Handle completed download."""
+        log.debug(
+            "MainWindow._on_task_completed: track %d, filepath=%s, _sequential_remaining=%d",
+            task.track_id,
+            task.filepath,
+            self._sequential_remaining,
+        )
         for tree_item, t in self.queue_rows:
             if t.track_id == task.track_id:
                 t.status = "completed"
@@ -1551,16 +1684,31 @@ class MainWindow(QMainWindow):
         # Restore max_concurrent when sequential download finishes
         if self._sequential_remaining > 0:
             self._sequential_remaining -= 1
+            log.debug("MainWindow._on_task_completed: remaining=%d", self._sequential_remaining)
             if self._sequential_remaining == 0:
+                log.debug(
+                    "MainWindow._on_task_completed: restoring max_concurrent to %d",
+                    self._original_max_concurrent,
+                )
                 self.download_mgr.max_concurrent = self._original_max_concurrent
         self._update_stop_button()
 
     def _on_task_failed(self, task: DownloadTask):
         """Handle failed download."""
+        log.debug(
+            "MainWindow._on_task_failed: track %d, status=%s, error=%s, _sequential_remaining=%d",
+            task.track_id,
+            task.status,
+            task.error,
+            self._sequential_remaining,
+        )
         found = False
         for tree_item, t in self.queue_rows:
             if t.track_id == task.track_id:
                 found = True
+                log.debug(
+                    "MainWindow._on_task_failed: found task in queue_rows, status=%s", t.status
+                )
                 if task.status == "stopped":
                     t.status = "queued"
                     tree_item.setText(2, "0%")
@@ -1573,10 +1721,16 @@ class MainWindow(QMainWindow):
         # Restore max_concurrent when sequential download finishes
         if self._sequential_remaining > 0:
             self._sequential_remaining -= 1
+            log.debug("MainWindow._on_task_failed: remaining=%d", self._sequential_remaining)
             if self._sequential_remaining == 0:
+                log.debug(
+                    "MainWindow._on_task_failed: restoring max_concurrent to %d",
+                    self._original_max_concurrent,
+                )
                 self.download_mgr.max_concurrent = self._original_max_concurrent
         # Dispatch next to prevent stall (for stopped tasks or missing tasks)
         if task.status == "stopped" or not found:
+            log.debug("MainWindow._on_task_failed: dispatching next after failure")
             self.download_mgr._dispatch_next()
         self._update_stop_button()
 
@@ -1610,7 +1764,7 @@ class MainWindow(QMainWindow):
         log.error("[ERROR DIALOG] %s: %s", title, message)
         QMessageBox.critical(self, title, message)
 
-    def closeEvent(self, event):
+    def closeEvent(self, event: QCloseEvent) -> None:
         """Save config, clean up threads, stop the server, and remove temp folders."""
         self._save_config()
         if self.search_thread.isRunning():

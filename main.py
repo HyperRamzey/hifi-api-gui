@@ -24,6 +24,7 @@ API_VERSION = "2.10"
 # Shared HTTP client is created in app lifespan for connection reuse
 _http_client: httpx.AsyncClient | None = None
 _http_client_lock = asyncio.Lock()
+_current_proxy_url: str | None = None
 
 # One lock per credential to avoid global contention during token refreshes
 _refresh_locks: dict[str, asyncio.Lock] = {}
@@ -61,8 +62,8 @@ def _build_http_client(proxy_url: str | None = None) -> httpx.AsyncClient:
         # Legacy httpx
         # If proxy_url is None, proxies=None is perfectly valid.
         # If it's a string, older httpx versions require it to be a dictionary mapping.
-        legacy_proxies = {"all://": proxy_url} if proxy_url else None
-        return httpx.AsyncClient(proxies=legacy_proxies, **client_kwargs)
+        proxy = httpx.Proxy(proxy_url) if proxy_url else None
+        return httpx.AsyncClient(proxy=proxy, **client_kwargs)
 
 
 @asynccontextmanager
@@ -294,11 +295,11 @@ async def _delayed_close(client: httpx.AsyncClient):
 
 
 async def update_global_client(force_new_proxy: bool = False):
-    global _http_client
+    global _http_client, _current_proxy_url
     async with _http_client_lock:
         proxy_to_avoid = None
-        if force_new_proxy and _http_client and _http_client.proxy:
-            proxy_to_avoid = str(_http_client.proxy.url)
+        if force_new_proxy and _current_proxy_url:
+            proxy_to_avoid = _current_proxy_url
 
         proxy_url = None
         if USE_PROXIES:
@@ -315,15 +316,13 @@ async def update_global_client(force_new_proxy: bool = False):
                     raise HTTPException(status_code=503, detail="Service Unavailable")
 
         # Only create a new client if the proxy is actually different
-        current_proxy_url: str | None = None
-        if _http_client and _http_client.proxy:
-            current_proxy_url = str(_http_client.proxy.url)
-        if _http_client and current_proxy_url == proxy_url:
+        if _http_client and _current_proxy_url == proxy_url:
             return
 
         new_client = _build_http_client(proxy_url)
         old_client = _http_client
         _http_client = new_client
+        _current_proxy_url = proxy_url
 
         if old_client is not None:
             asyncio.create_task(_delayed_close(old_client))
@@ -498,6 +497,7 @@ async def make_request(
     headers = {"authorization": f"Bearer {token}"}
 
     try:
+        resp: httpx.Response | None = None
         for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
             resp = await client.get(url, headers=headers, params=params)
             _log_response("GET", url, resp)
@@ -539,6 +539,8 @@ async def make_request(
 
             break
 
+        if resp is None:
+            raise RuntimeError("No response received")
         resp.raise_for_status()
         return {"version": API_VERSION, "data": resp.json()}
     except httpx.HTTPStatusError as e:
@@ -572,6 +574,7 @@ async def authed_get_json(
     headers = {"authorization": f"Bearer {token}"}
 
     try:
+        resp: httpx.Response | None = None
         for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
             resp = await client.get(url, headers=headers, params=params)
             _log_response("GET", url, resp)
@@ -613,6 +616,8 @@ async def authed_get_json(
 
             break
 
+        if resp is None:
+            raise RuntimeError("No response received")
         resp.raise_for_status()
         return resp.json(), token, cred
     except httpx.HTTPStatusError as e:
@@ -672,7 +677,7 @@ async def get_track_manifests(
     ]
     for f in formats:
         params.append(("formats", f))
-    res = await make_request(url, params=params)
+    res = await make_request(url, params=dict(params))
     try:
         drm_data = res["data"]["data"]["attributes"]["drmData"]
         if drm_data:
@@ -1177,7 +1182,8 @@ async def get_artist(
     for res in results:
         if isinstance(res, Exception):
             continue
-        tracks.extend(res)
+        if isinstance(res, list):
+            tracks.extend(res)
 
     return {"version": API_VERSION, "albums": page_data, "tracks": tracks}
 

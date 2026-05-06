@@ -920,31 +920,26 @@ class TestMainWindow:
         assert item.text(2) == "Discovery"
         assert item.text(3) == "4:03"
 
-    def test_deduplication_skips_duplicate_track_ids(self, qtbot: "QtBot", sample_track_data: dict):
-        """_populate_results_safe skips tracks whose IDs were already seen."""
+    def test_all_items_displayed_no_dedup(self, qtbot: "QtBot", sample_track_data: dict):
+        """_populate_results_safe shows all items from the API response (no dedup)."""
         from gui_downloader import MainWindow
 
         window = MainWindow()
         qtbot.addWidget(window)
 
-        # First page: two unique tracks (fixture id is 62397812)
-        page1 = [sample_track_data, {**sample_track_data, "id": 99, "title": "Second Track"}]
-        window._populate_results_safe(page1)
-        assert window.results_tree.topLevelItemCount() == 2
-
-        # Second page: one duplicate of first track (same id=62397812) + one new
-        page2 = [
-            {**sample_track_data, "title": "Duplicate"},
-            {**sample_track_data, "id": 100, "title": "Third Track"},
+        # Two items including a duplicate ID
+        items = [
+            {**sample_track_data, "id": 62397812, "title": "First Track"},
+            {**sample_track_data, "id": 62397812, "title": "Duplicate Track"},
         ]
-        window._is_load_more = True
-        window._populate_results_safe(page2)
-        # Page-by-page: tree shows only page 2's non-duplicate items
-        assert window.results_tree.topLevelItemCount() == 1
-        assert window.results_tree.topLevelItem(0).text(0) == "Third Track"
+        window._populate_results_safe(items)
+        # Both items are shown (no dedup)
+        assert window.results_tree.topLevelItemCount() == 2
+        assert window.results_tree.topLevelItem(0).text(0) == "First Track"
+        assert window.results_tree.topLevelItem(1).text(0) == "Duplicate Track"
 
-    def test_page_navigation_displays_cached_page(self, qtbot: "QtBot", sample_track_data: dict):
-        """Going back to a previous page restores its cached items."""
+    def test_page_navigation_refetches_data(self, qtbot: "QtBot", sample_track_data: dict):
+        """Going back to a previous page refetches data from the API."""
         from gui_downloader import MainWindow
 
         window = MainWindow()
@@ -960,7 +955,6 @@ class TestMainWindow:
         window._search_query = "test"
         window._populate_results_safe(page1)
         assert window.results_tree.topLevelItemCount() == 2
-        assert window.results_tree.topLevelItem(0).text(0) == "Track A"
 
         # Simulate page 2
         page2 = [
@@ -969,16 +963,13 @@ class TestMainWindow:
         window._current_page = 1
         window._is_load_more = True
         window._populate_results_safe(page2)
-        # Page-by-page: tree shows only page 2's items
         assert window.results_tree.topLevelItemCount() == 1
-        assert window.results_tree.topLevelItem(0).text(0) == "Track C"
 
-        # Go back to page 1 (from cache)
-        window._on_prev_page()
+        # Go back to page 1 via _load_page (refetch)
+        with patch.object(window, "_load_page") as mock_load:
+            window._on_prev_page()
+            mock_load.assert_called_once()
         assert window._current_page == 0
-        assert window.results_tree.topLevelItemCount() == 2
-        assert window.results_tree.topLevelItem(0).text(0) == "Track A"
-        assert window.results_tree.topLevelItem(1).text(0) == "Track B"
 
     def test_sort_indicator_updates_on_header_click(self, qtbot: "QtBot"):
         """Clicking a result header column sets the sort indicator."""
@@ -1038,7 +1029,7 @@ class TestMainWindow:
         window = MainWindow()
         qtbot.addWidget(window)
 
-        window.on_download_progress(75, "Downloading... 75%")
+        window.on_download_progress(75, "Downloading... 75%", 0)
         assert window.download_progress.value() == 75
 
     def test_quality_combo_saves_config(
