@@ -1165,8 +1165,8 @@ class TestDownloadWorkerFetchManifest:
 
         assert task.download_urls == ["https://stream.tidal.com/track/12345.flac?token=abc"]
 
-    def test_fetch_manifest_drm_emits_failed(self, drm_manifest_b64: str):
-        """DRM manifest sets drm_locked status and emits task_failed."""
+    def test_fetch_manifest_drm_raises(self, drm_manifest_b64: str):
+        """DRM manifest sets drm_locked status and raises RuntimeError."""
         worker = self._make_worker()
         worker.api.get_manifest.return_value = {
             "manifest": drm_manifest_b64,
@@ -1182,18 +1182,11 @@ class TestDownloadWorkerFetchManifest:
             album="Al",
             duration=60,
         )
-        failed_emitted = False
 
-        def on_failed(t):
-            nonlocal failed_emitted
-            failed_emitted = True
-
-        worker.task_failed.connect(on_failed)
-        worker._fetch_manifest(task)
+        with pytest.raises(RuntimeError, match="DRM"):
+            worker._fetch_manifest(task)
 
         assert task.status == "drm_locked"
-        assert "DRM" in task.error
-        assert failed_emitted is True
 
     def test_fetch_manifest_no_manifest_raises(self):
         """Empty manifest raises ValueError."""
@@ -1235,3 +1228,229 @@ class TestDownloadWorkerFetchManifest:
         worker._fetch_manifest(task)
 
         assert task.download_urls == ["https://stream.tidal.com/track/12345.flac?token=abc"]
+
+
+# ─── DownloadManager tests ───────────────────────────────────────────────────
+
+
+class TestDownloadManagerCleanup:
+    """Tests for DownloadManager._cleanup_finished_threads."""
+
+    def test_cleanup_removes_finished_thread(self):
+        """_cleanup_finished_threads removes threads that are no longer running."""
+        from gui_downloader import DownloadManager
+
+        mgr = DownloadManager("http://127.0.0.1:8000", Path("/tmp"))
+        # Create a thread that has already finished (never started)
+        from PyQt6.QtCore import QThread
+
+        finished_thread = QThread()
+        assert not finished_thread.isRunning()
+
+        # Manually add it to active_threads (simulating a thread that just finished)
+        from unittest.mock import MagicMock
+
+        mgr.active_threads.append((finished_thread, MagicMock()))
+        assert len(mgr.active_threads) == 1
+
+        mgr._cleanup_finished_threads()
+        assert len(mgr.active_threads) == 0
+
+    def test_cleanup_keeps_running_thread(self):
+        """_cleanup_finished_threads keeps threads that are still running."""
+        from gui_downloader import DownloadManager
+
+        mgr = DownloadManager("http://127.0.0.1:8000", Path("/tmp"))
+        from unittest.mock import MagicMock
+
+        from PyQt6.QtCore import QThread
+
+        thread = QThread()
+        thread.start()
+        try:
+            mgr.active_threads.append((thread, MagicMock()))
+            assert len(mgr.active_threads) == 1
+
+            mgr._cleanup_finished_threads()
+            assert len(mgr.active_threads) == 1
+        finally:
+            thread.quit()
+            thread.wait()
+
+    def test_cleanup_mixed_threads(self):
+        """_cleanup_finished_threads removes only finished threads."""
+        from gui_downloader import DownloadManager
+
+        mgr = DownloadManager("http://127.0.0.1:8000", Path("/tmp"))
+        from unittest.mock import MagicMock
+
+        from PyQt6.QtCore import QThread
+
+        # One running, one finished
+        running = QThread()
+        running.start()
+        finished = QThread()  # never started
+
+        mgr.active_threads.append((running, MagicMock()))
+        mgr.active_threads.append((finished, MagicMock()))
+        assert len(mgr.active_threads) == 2
+
+        mgr._cleanup_finished_threads()
+        assert len(mgr.active_threads) == 1
+        assert mgr.active_threads[0][0] is running
+
+        running.quit()
+        running.wait()
+
+
+class TestDownloadManagerSequentialDispatch:
+    """Tests that completed/failed tasks trigger dispatch of the next queued task."""
+
+    def _make_mgr(self):
+        """Create a DownloadManager with mocked API."""
+        from gui_downloader import DownloadManager
+
+        mgr = DownloadManager("http://127.0.0.1:8000", Path("/tmp"), max_concurrent=1)
+        mgr.api = MagicMock()
+        return mgr
+
+    def _make_task(self, track_id: int):
+        return DownloadTask(
+            track_id=track_id,
+            title=f"Track {track_id}",
+            artist="Artist",
+            album="Album",
+            duration=180,
+        )
+
+    def test_on_task_done_triggers_dispatch(self):
+        """When a task completes, _dispatch_next is called and starts the next task."""
+
+        mgr = self._make_mgr()
+
+        # Add 3 tasks to the queue
+        task1 = self._make_task(1)
+        task2 = self._make_task(2)
+        task3 = self._make_task(3)
+
+        # Patch QThread/DownloadWorker to avoid real downloads
+        with (
+            patch("gui_downloader.QThread") as MockThread,
+            patch("gui_downloader.DownloadWorker") as MockWorker,
+        ):
+            mock_thread = MagicMock()
+            mock_thread.isRunning.return_value = True
+            MockThread.return_value = mock_thread
+
+            mock_worker = MagicMock()
+            MockWorker.return_value = mock_worker
+
+            # Add tasks — first one dispatches immediately
+            mgr.add(task1)
+            mgr.add(task2)
+            mgr.add(task3)
+
+            # First task should have been dispatched
+            assert MockThread.call_count == 1
+            assert len(mgr.queue) == 2  # task1 dispatched, 2 remain
+
+            # Simulate task_done: the thread for task1 finishes
+            mock_thread.isRunning.return_value = False
+            mgr.active_threads = [(mock_thread, mock_worker)]
+
+            # Emit task_done signal (simulates worker completing)
+            # _on_task_done should clean up the finished thread and dispatch next
+            mgr._on_task_done(task1)
+
+            # Second task should now be dispatched
+            assert MockThread.call_count == 2
+            assert len(mgr.queue) == 1  # task2 dispatched, 1 remains
+
+    def test_on_task_failed_triggers_dispatch(self):
+        """When a task fails, _dispatch_next is called and starts the next task."""
+
+        mgr = self._make_mgr()
+
+        task1 = self._make_task(1)
+        task2 = self._make_task(2)
+
+        with (
+            patch("gui_downloader.QThread") as MockThread,
+            patch("gui_downloader.DownloadWorker") as MockWorker,
+        ):
+            mock_thread = MagicMock()
+            mock_thread.isRunning.return_value = True
+            MockThread.return_value = mock_thread
+
+            mock_worker = MagicMock()
+            MockWorker.return_value = mock_worker
+
+            mgr.add(task1)
+            mgr.add(task2)
+
+            assert MockThread.call_count == 1
+            assert len(mgr.queue) == 1
+
+            # Simulate task failure
+            mock_thread.isRunning.return_value = False
+            mgr.active_threads = [(mock_thread, mock_worker)]
+            task1.status = "failed"
+            task1.error = "manifest error"
+
+            mgr._on_task_failed(task1)
+
+            # Second task should be dispatched
+            assert MockThread.call_count == 2
+            assert len(mgr.queue) == 0
+
+    def test_sequential_queue_drains(self):
+        """A queue of tasks drains sequentially: each completion triggers the next."""
+
+        mgr = self._make_mgr()
+
+        tasks = [self._make_task(i) for i in range(1, 6)]  # 5 tasks
+
+        with (
+            patch("gui_downloader.QThread") as MockThread,
+            patch("gui_downloader.DownloadWorker") as MockWorker,
+        ):
+            mock_thread = MagicMock()
+            mock_thread.isRunning.return_value = True
+            MockThread.return_value = mock_thread
+
+            mock_worker = MagicMock()
+            MockWorker.return_value = mock_worker
+
+            # Add all tasks
+            for t in tasks:
+                mgr.add(t)
+
+            # First dispatch happened
+            assert MockThread.call_count == 1
+            assert len(mgr.queue) == 4
+
+            # Simulate completion of task 1 → task 2 starts
+            mock_thread.isRunning.return_value = False
+            mgr.active_threads = [(mock_thread, mock_worker)]
+            mgr._on_task_done(tasks[0])
+            assert MockThread.call_count == 2
+            assert len(mgr.queue) == 3
+
+            # Simulate completion of task 2 → task 3 starts
+            mgr._on_task_done(tasks[1])
+            assert MockThread.call_count == 3
+            assert len(mgr.queue) == 2
+
+            # Simulate completion of task 3 → task 4 starts
+            mgr._on_task_done(tasks[2])
+            assert MockThread.call_count == 4
+            assert len(mgr.queue) == 1
+
+            # Simulate completion of task 4 → task 5 starts
+            mgr._on_task_done(tasks[3])
+            assert MockThread.call_count == 5
+            assert len(mgr.queue) == 0
+
+            # Simulate completion of task 5 → no more tasks to dispatch
+            mgr._on_task_done(tasks[4])
+            assert MockThread.call_count == 5  # no additional dispatch

@@ -57,6 +57,8 @@ Each fragment is individually unplayable. The correct approach in `DownloadWorke
 
 ### GUI thread model
 - **QThread worker pattern**: Worker inherits `QObject` (NOT `QThread`), moved via `moveToThread()`, communicates via `pyqtSignal`
+- Worker `run()` must call `self.thread().quit()` in a `finally` block so the QThread exits its event loop after completion
+- Thread-finished cleanup uses `cleanup_and_dispatch()` helper that removes the thread from `active_threads` AND calls `_dispatch_next()` to pull the next queued item
 - `self.search_thread` / `self.search_worker` are instance variables — never create threads as local variables (GC will collect them while running)
 - `QTimer.singleShot(0, callback)` for thread-safe UI updates from background threads
 - `closeEvent` cleans up: search thread quit+wait, server subprocess terminate+wait
@@ -77,6 +79,7 @@ Each fragment is individually unplayable. The correct approach in `DownloadWorke
 - Cover icon column index is **5** (not 4) — Quality column shifted it
 - "Download All" temporarily sets `download_mgr.max_concurrent = 1` during download
 - **Cover art embedding**: cover fetched during manifest decode, embedded into output file via mutagen (FLAC: `mutagen.flac.Picture`, M4A: `mutagen.mp4.MP4["covr"]`)
+- **DRM handling**: `decode_manifest()` detects Widevine via `encryptionType` field or `cenc:pssh`/`widevine` XML markers. DRM-locked tracks raise `RuntimeError("DRM-protected track (not supported in V1)")` from `_fetch_manifest()` — status is set to `drm_locked` before the raise, caught by `run()`'s except block which emits `task_failed`. Status `drm_locked` is excluded from the `except` block's status check so it doesn't get overwritten to `failed`.
 - **Stop button**: enabled when tasks have status "manifest"/"downloading", calls `download_mgr.stop_all()` which sets `stopped=True`, terminates threads; tasks reset to "Queued" status (not removed from queue, not marked failed)
 
 ### Server lifecycle (auto-start)
@@ -95,7 +98,7 @@ Each fragment is individually unplayable. The correct approach in `DownloadWorke
 
 ## Testing
 - `pytest` + `pytest-qt` (PyQt6 testing) + `pytest-httpserver` (mock API)
-- Tests in `tests/test_gui_downloader.py` — 64 tests across 7 classes
+- Tests in `tests/test_gui_downloader.py` — 70 tests across 9 classes
 - `pyproject.toml` has `addopts = "-v --tb=short --color=yes"` — verbose by default
 - **Never monkeypatch PyQt6 classes in `pytest_configure` or `pytest_runtest_setup`** — causes Qt event loop hangs
 - `show_error_dialog()` on MainWindow wraps QMessageBox — override/monkeypatch in tests instead of calling QMessageBox.critical directly

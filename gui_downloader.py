@@ -14,7 +14,7 @@ from pathlib import Path
 
 import requests
 from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QPixmap, QCloseEvent
+from PyQt6.QtGui import QCloseEvent, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -336,10 +336,14 @@ class DownloadWorker(QObject):
             task.progress = 100.0
             self.task_done.emit(task)
         except Exception as e:
-            if task.status != "stopped":
+            if task.status not in ("stopped", "drm_locked"):
                 task.status = "failed"
-                task.error = str(e)
+            task.error = str(e)
             self.task_failed.emit(task)
+        finally:
+            t = self.thread()
+            if t:
+                t.quit()
 
     def _fetch_manifest(self, task: DownloadTask):
         """Fetch and decode the track manifest."""
@@ -372,9 +376,7 @@ class DownloadWorker(QObject):
 
             if enc_type == "WIDEVINE":
                 task.status = "drm_locked"
-                task.error = "DRM-protected track (not supported in V1)"
-                self.task_failed.emit(task)
-                return
+                raise RuntimeError("DRM-protected track (not supported in V1)")
 
             urls, actual_enc, init_url, codec = decode_manifest(manifest, mime_type)
             if actual_enc != "UNKNOWN":
@@ -382,9 +384,7 @@ class DownloadWorker(QObject):
 
             if enc_type == "WIDEVINE":
                 task.status = "drm_locked"
-                task.error = "DRM-protected track (not supported in V1)"
-                self.task_failed.emit(task)
-                return
+                raise RuntimeError("DRM-protected track (not supported in V1)")
 
             if not urls:
                 last_error = ValueError("No download URLs in manifest")
@@ -394,7 +394,7 @@ class DownloadWorker(QObject):
                 label = {"FLAC": "FLAC", "AACLC": "AAC 256kbps", "HEAACV1": "AAC 96kbps"}.get(
                     attempt_fmt, attempt_fmt
                 )
-                self.progress.emit(10, f"Downscaling to {label}...")
+                self.progress.emit(10, f"Downscaling to {label}...", task.track_id)
                 used_fallback = True
 
             task.download_urls = urls  # type: ignore
@@ -620,6 +620,13 @@ class DownloadManager(QObject):
                 len(self.queue),
                 len(self.active_threads),
             )
+            for t, w in self.active_threads:
+                tid = w.task.track_id if hasattr(w, "task") and w.task else "?"
+                log.debug(
+                    "DownloadManager._dispatch_next: active thread task=%s isRunning=%s",
+                    tid,
+                    t.isRunning(),
+                )
             if len(self.active_threads) >= self.max_concurrent:
                 log.debug(
                     "DownloadManager._dispatch_next: all slots full (%d/%d), waiting",
@@ -649,8 +656,13 @@ class DownloadManager(QObject):
         worker.task_done.connect(self._on_task_done)
         worker.task_failed.connect(self._on_task_failed)
 
+        def cleanup_and_dispatch(t=thread, w=worker):
+            if (t, w) in self.active_threads:
+                self.active_threads.remove((t, w))
+            self._dispatch_next()
+
         # Clean up when thread finishes
-        thread.finished.connect(lambda: self.active_threads.remove((thread, worker)))
+        thread.finished.connect(cleanup_and_dispatch)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(worker.deleteLater)
 
@@ -661,6 +673,18 @@ class DownloadManager(QObject):
     def _on_worker_progress(self, pct: int, msg: str, task_id: int):
         self.progress.emit(pct, msg, task_id)
 
+    def _cleanup_finished_threads(self):
+        """Remove threads that are no longer running from active_threads."""
+        before = len(self.active_threads)
+        self.active_threads = [(t, w) for t, w in self.active_threads if t.isRunning()]
+        removed = before - len(self.active_threads)
+        if removed:
+            log.debug(
+                "DownloadManager._cleanup_finished_threads: removed %d finished threads, remaining=%d",
+                removed,
+                len(self.active_threads),
+            )
+
     def _on_task_done(self, task: DownloadTask):
         log.debug(
             "DownloadManager._on_task_done: track %d completed, queue_size=%d, active_threads=%d",
@@ -670,6 +694,7 @@ class DownloadManager(QObject):
         )
         self.task_completed.emit(task)
         self.task_status_changed.emit()
+        self._cleanup_finished_threads()
         self._dispatch_next()
 
     def _on_task_failed(self, task: DownloadTask):
@@ -682,6 +707,7 @@ class DownloadManager(QObject):
         )
         self.task_failed.emit(task)
         self.task_status_changed.emit()
+        self._cleanup_finished_threads()
         self._dispatch_next()
 
     def stop_all(self):
@@ -1658,11 +1684,21 @@ class MainWindow(QMainWindow):
         """Called from DownloadWorker via signal."""
         self.download_progress.setValue(pct)
 
+        # Throttle UI updates: only update every 5% or at key milestones
+        last = getattr(self, "_last_progress_pct", {})
+        if task_id in last and pct - last[task_id] < 5 and pct not in (0, 100):
+            return
+        last[task_id] = pct
+        self._last_progress_pct = last
+
         # Update queue rows for the active task only
         for tree_item, task in self.queue_rows:
             if task.track_id == task_id and task.status in ("manifest", "downloading", "queued"):
                 tree_item.setText(2, f"{pct}%")
-                tree_item.setText(3, msg)
+                if pct > 0 and pct < 100:
+                    tree_item.setText(3, "Downloading...")
+                else:
+                    tree_item.setText(3, msg)
                 break
 
     def _on_task_completed(self, task: DownloadTask):
