@@ -324,9 +324,9 @@ class DownloadWorker(QObject):
         self.output_dir = output_dir
         self.download_mgr = download_mgr
 
-    def run(self, task: DownloadTask):
+    def run(self):
         """Execute the full download pipeline for a task."""
-        self.task = task
+        task = self.task
         try:
             self._fetch_manifest(task)
             if self.download_mgr and self.download_mgr.stopped:
@@ -648,10 +648,11 @@ class DownloadManager(QObject):
 
         thread = QThread()
         worker = DownloadWorker(self.api, self.output_dir, self)
+        worker.task = task
         worker.moveToThread(thread)
 
         # Connect signals
-        thread.started.connect(lambda: worker.run(task))
+        thread.started.connect(worker.run)
         worker.progress.connect(self._on_worker_progress)
         worker.task_done.connect(self._on_task_done)
         worker.task_failed.connect(self._on_task_failed)
@@ -756,6 +757,8 @@ class SearchWorker(QObject):
 class MainWindow(QMainWindow):
     """Main application window."""
 
+    _trigger_search_signal = pyqtSignal(str, int, int)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("hifiT Downloader")
@@ -780,6 +783,7 @@ class MainWindow(QMainWindow):
         self.search_thread = QThread()
         self.search_worker = SearchWorker(self.api)
         self.search_worker.moveToThread(self.search_thread)
+        self._trigger_search_signal.connect(self.search_worker.run)
         self.search_worker.results_ready.connect(self._populate_results_safe)
         self.search_worker.search_error.connect(self._on_search_error)
         # Thread is started on first search, not at init
@@ -881,6 +885,8 @@ class MainWindow(QMainWindow):
         self.results_tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
         self.results_tree.itemClicked.connect(self._on_result_clicked)
         if self.results_tree.header():
+            self.results_tree.header().setSectionsClickable(True)
+            self.results_tree.header().setSortIndicatorShown(True)
             self.results_tree.header().sectionClicked.connect(self._on_results_header_clicked)  # type: ignore[union-attr]
         results_layout.addWidget(self.results_tree)
 
@@ -944,6 +950,8 @@ class MainWindow(QMainWindow):
         self.queue_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.queue_tree.customContextMenuRequested.connect(self._show_queue_context_menu)
         if self.queue_tree.header():
+            self.queue_tree.header().setSectionsClickable(True)
+            self.queue_tree.header().setSortIndicatorShown(True)
             self.queue_tree.header().sectionClicked.connect(self._on_queue_header_clicked)  # type: ignore[union-attr]
         queue_layout.addWidget(self.queue_tree)
 
@@ -1174,7 +1182,7 @@ class MainWindow(QMainWindow):
     def _emit_search(self):
         """Emit search in the worker's thread context."""
         log.debug("Emitting search for: %s", self.search_worker._query)
-        self.search_worker.run(
+        self._trigger_search_signal.emit(
             self.search_worker._query,
             self.search_worker._limit,
             self._search_offset,
@@ -1439,7 +1447,7 @@ class MainWindow(QMainWindow):
             self.search_worker._limit,
             self._search_offset,
         )
-        self.search_worker.run(
+        self._trigger_search_signal.emit(
             self._search_query,
             self._search_limit,
             self._search_offset,

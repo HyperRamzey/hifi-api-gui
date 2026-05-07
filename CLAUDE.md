@@ -120,3 +120,6 @@ Each fragment is individually unplayable. The correct approach in `DownloadWorke
 - **Quality fallback chain** — `FLAC_HIRES → FLAC → AACLC → HEAACV1`. GUI auto-downgrades if preferred quality unavailable.
 - **QProgressBar in PyQt6 6.11** starts in indeterminate mode — always call `setValue(0)` after construction
 - **mutagen** required for cover art embedding (FLAC: `mutagen.flac.Picture`, M4A: `mutagen.mp4.MP4["covr"]`) — already in `requirements.txt`
+- **QThread lambda trap**: `thread.started.connect(lambda: worker.run(task))` executes the lambda in the **main thread**, blocking the GUI. Fix: set `worker.task = task` as an attribute, then `thread.started.connect(worker.run)` — PyQt dispatches direct method references to the worker's thread context
+- **Tree header sorting**: `sectionClicked` signal requires `setSectionsClickable(True)` to fire; sort indicator arrows require `setSortIndicatorShown(True)` to display — both must be called explicitly
+- **SearchWorker must be triggered via signals**: never call `search_worker.run()` directly from the main thread even via `QTimer.singleShot(0, ...)`. Define a `pyqtSignal` on MainWindow, connect it to `search_worker.run`, and `.emit()` from the singleShot callback
