@@ -128,20 +128,23 @@ class Api:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "hifiT-Downloader/1.0"})
+        self._lock = threading.Lock()
 
     def ping(self) -> bool:
         try:
-            r = self.session.get(f"{API_BASE}/", timeout=3)
+            with self._lock:
+                r = self.session.get(f"{API_BASE}/", timeout=3)
             return r.status_code == 200
         except Exception:
             return False
 
     def search_tracks(self, query: str, limit: int = 25, offset: int = 0) -> list[dict]:
-        r = self.session.get(
-            f"{API_BASE}/search/",
-            params={"s": query, "limit": limit, "offset": offset},
-            timeout=15,
-        )
+        with self._lock:
+            r = self.session.get(
+                f"{API_BASE}/search/",
+                params={"s": query, "limit": limit, "offset": offset},
+                timeout=15,
+            )
         r.raise_for_status()
         data = r.json()
         return data.get("data", {}).get("items", [])
@@ -153,11 +156,12 @@ class Api:
         response formats. Returns a dict with 'manifest' (base64 or raw bytes),
         'manifestMimeType', and 'download_urls' keys.
         """
-        r = self.session.get(
-            f"{API_BASE}/trackManifests/",
-            params={"id": str(track_id), "formats": fmt},
-            timeout=15,
-        )
+        with self._lock:
+            r = self.session.get(
+                f"{API_BASE}/trackManifests/",
+                params={"id": str(track_id), "formats": fmt},
+                timeout=15,
+            )
         r.raise_for_status()
         data = r.json().get("data", {})
         inner = data.get("data", data)
@@ -171,7 +175,8 @@ class Api:
             # /trackManifests/ returns a URI — fetch the manifest content
             uri = attrs["uri"]
             try:
-                manifest_resp = self.session.get(uri, timeout=15)
+                with self._lock:
+                    manifest_resp = self.session.get(uri, timeout=15)
                 manifest_resp.raise_for_status()
                 manifest = manifest_resp.text
                 if not mime_type:
@@ -195,7 +200,8 @@ class Api:
         }
 
     def get_cover_url(self, track_id: int) -> str | None:
-        r = self.session.get(f"{API_BASE}/cover/", params={"id": track_id}, timeout=10)
+        with self._lock:
+            r = self.session.get(f"{API_BASE}/cover/", params={"id": track_id}, timeout=10)
         r.raise_for_status()
         covers = r.json().get("covers", [])
         if covers:
@@ -205,7 +211,8 @@ class Api:
 
     def fetch_cover_bytes(self, url: str) -> bytes | None:
         try:
-            r = self.session.get(url, timeout=10)
+            with self._lock:
+                r = self.session.get(url, timeout=10)
             r.raise_for_status()
             return r.content
         except Exception:
@@ -458,7 +465,8 @@ class DownloadWorker(QObject):
             # Download init segment if present
             if init_url:
                 self.progress.emit(25, "Downloading init segment...", task.track_id)
-                r = session.get(init_url, timeout=60)
+                with self.api._lock:
+                    r = session.get(init_url, timeout=60)
                 r.raise_for_status()
                 with open(combined_path, "wb") as f:
                     f.write(r.content)
@@ -467,7 +475,8 @@ class DownloadWorker(QObject):
             self.progress.emit(25, "Downloading segments...", task.track_id)
             with open(combined_path, "ab") as f:
                 for i, url in enumerate(urls):
-                    r = session.get(url, stream=True, timeout=60)
+                    with self.api._lock:
+                        r = session.get(url, stream=True, timeout=60)
                     r.raise_for_status()
                     for chunk in r.iter_content(chunk_size=65536):
                         if not chunk:
@@ -1480,11 +1489,34 @@ class MainWindow(QMainWindow):
         if not track_id:
             return
 
-        cover_url = self.api.get_cover_url(track_id)
-        if not cover_url:
+        try:
+            cover_url = self.api.get_cover_url(track_id)
+            if not cover_url:
+                return
+
+            cover_bytes = self.api.fetch_cover_bytes(cover_url)
+        except requests.exceptions.HTTPError as e:
+            # Handle API errors (e.g. 429 Too Many Requests) gracefully
+            log.warning("HTTP error fetching cover for track %d: %s", track_id, e)
+            QMessageBox.warning(
+                self,
+                "Cover Art Error",
+                f"Failed to load cover art for this track.\n\n"
+                f"The API may be temporarily rate-limited.\n"
+                f"Click again to retry, or skip to another track.",
+            )
+            return
+        except Exception as e:
+            log.warning("Error fetching cover for track %d: %s", track_id, e)
+            QMessageBox.warning(
+                self,
+                "Cover Art Error",
+                f"Failed to load cover art for this track.\n\n"
+                f"Error: {e}\n\n"
+                f"Click again to retry, or skip to another track.",
+            )
             return
 
-        cover_bytes = self.api.fetch_cover_bytes(cover_url)
         if cover_bytes:
             pixmap = QPixmap()
             if pixmap.loadFromData(cover_bytes):
