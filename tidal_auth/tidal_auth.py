@@ -107,11 +107,15 @@ async def main():
         try:
             await authrize.get_auth_response()
         except Exception as e:
-            rich.print(f"[red]Exception: {e}.[/red]")
+            rich.print(f"[red]Exception: {type(e).__name__}: {e}.[/red]")
+            return False
+
+        if authrize.response is None:
+            rich.print("[red]No response received.[/red]")
             return False
 
         if authrize.response.status_code != 200:
-            rich.print(f"[red]Error {authrize.response.status_code}.[/red]")
+            rich.print(f"[red]Error {authrize.response.status_code}: {authrize.response.text}[/red]")
             return False
 
         res = authrize.response.json()
