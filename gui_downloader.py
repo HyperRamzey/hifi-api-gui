@@ -239,11 +239,11 @@ class Api:
         return r.json()
 
     def get_track_info(self, track_id: int) -> dict:
-        """Fetch track metadata (genres, bpm, label, etc.)."""
+        """Fetch track metadata (bpm, copyright, isrc, explicit, etc.)."""
         with self._lock:
             r = self.session.get(
-                f"{API_BASE}/track/",
-                params={"id": str(track_id), "quality": "FLAC"},
+                f"{API_BASE}/info/",
+                params={"id": str(track_id)},
                 timeout=10,
             )
         r.raise_for_status()
@@ -281,6 +281,12 @@ class DownloadTask:
     copyright: str = ""
     isrc: str = ""
     explicit: bool = False
+    # Basic metadata (from /info/ endpoint)
+    track_number: int = 0
+    disc_number: int = 0
+    album_artist: str = ""
+    date: str = ""
+    url: str = ""
 
 
 # ─── Manifest Decoding ────────────────────────────────────────────────────────
@@ -479,21 +485,33 @@ class DownloadWorker(QObject):
             try:
                 _delay()
                 track_info = self.api.get_track_info(task.track_id)
-                meta = track_info.get("data", {}).get("attributes", {})
-                if isinstance(track_info.get("data"), dict) and "meta" in track_info.get(
-                    "data", {}
-                ):
-                    meta = track_info["data"]["meta"]
-                # Also check top-level meta key
-                if not meta and "meta" in track_info:
-                    meta = track_info["meta"]
-                task.genres = ", ".join(meta.get("genres", [])) if meta.get("genres") else ""
+                # /info/ returns metadata directly at data.* (not nested in attributes/meta)
+                meta = track_info.get("data", {})
+                if not isinstance(meta, dict):
+                    meta = {}
+                # Basic metadata
+                task.track_number = meta.get("trackNumber", 0) or 0
+                task.disc_number = meta.get("volumeNumber", 0) or 0
+                task.url = meta.get("url", "")
+                album = meta.get("album", {})
+                if isinstance(album, dict):
+                    task.album = album.get("title", task.album)
+                artist = meta.get("artist", {})
+                if isinstance(artist, dict):
+                    task.album_artist = artist.get("name", "")
+                # Extended metadata
                 task.bpm = meta.get("bpm")
-                task.initial_key = meta.get("initialKey", "")
-                task.label = meta.get("label", "")
                 task.copyright = meta.get("copyright", "")
                 task.isrc = meta.get("isrc", "")
                 task.explicit = bool(meta.get("explicit", False))
+                # key + keyScale combine to form the musical key
+                if meta.get("key"):
+                    ks = meta.get("keyScale", "")
+                    task.initial_key = f"{meta['key']} {ks}" if ks else meta["key"]
+                task.label = meta.get("label", "")
+                # Date from streamStartDate
+                if meta.get("streamStartDate"):
+                    task.date = meta["streamStartDate"][:4]  # year only
             except Exception:
                 pass  # Extended metadata is optional
 
@@ -691,10 +709,30 @@ class DownloadWorker(QObject):
             pass  # Metadata embedding is optional
 
     def _embed_metadata_flac(self, filepath: Path, task: DownloadTask):
-        """Write extended metadata to a FLAC file using vorbis comments."""
+        """Write metadata to a FLAC file using vorbis comments (basic + extended)."""
         from mutagen.flac import FLAC
 
         audio = FLAC(str(filepath))
+        if audio.tags is None:
+            audio.add_tags()
+        # Basic metadata
+        if task.title:
+            audio.tags["TITLE"] = task.title
+        if task.artist:
+            audio.tags["ARTIST"] = task.artist
+        if task.album:
+            audio.tags["ALBUM"] = task.album
+        if task.album_artist:
+            audio.tags["ALBUMARTIST"] = task.album_artist
+        if task.track_number:
+            audio.tags["TRACKNUMBER"] = str(task.track_number)
+        if task.disc_number:
+            audio.tags["DISCNUMBER"] = str(task.disc_number)
+        if task.date:
+            audio.tags["DATE"] = task.date
+        if task.url:
+            audio.tags["URL"] = task.url
+        # Extended metadata
         if task.genres:
             audio.tags["GENRE"] = task.genres
         if task.bpm is not None:
@@ -710,12 +748,30 @@ class DownloadWorker(QObject):
         audio.save()
 
     def _embed_metadata_mp4(self, filepath: Path, task: DownloadTask):
-        """Write extended metadata to an M4A file using iTunes atoms."""
+        """Write metadata to an M4A file using iTunes atoms (basic + extended)."""
         from mutagen.mp4 import MP4
 
         audio = MP4(str(filepath))
         if audio.tags is None:
             return
+        # Basic metadata
+        if task.title:
+            audio.tags["\xa9nam"] = task.title
+        if task.artist:
+            audio.tags["\xa9ART"] = task.artist
+        if task.album:
+            audio.tags["\xa9alb"] = task.album
+        if task.album_artist:
+            audio.tags["aART"] = task.album_artist
+        if task.track_number:
+            audio.tags["trkn"] = [[task.track_number, 1]]
+        if task.disc_number:
+            audio.tags["disk"] = [[task.disc_number, 1]]
+        if task.date:
+            audio.tags["\xa9day"] = task.date
+        if task.url:
+            audio.tags["purl"] = task.url
+        # Extended metadata
         if task.genres:
             audio.tags["\xa9gen"] = task.genres
         if task.bpm is not None:
@@ -1468,7 +1524,10 @@ class MainWindow(QMainWindow):
             album = item_data.get("album", {}).get("title", "Unknown")
             duration = item_data.get("duration", 0)
             min_duration = item_data.get("minDuration", "")
-            audio_quality = item_data.get("audioQuality", "")
+            # audioQuality is always the base quality; mediaMetadata.tags[-1] is the highest available
+            media_meta = item_data.get("mediaMetadata", {})
+            media_tags = media_meta.get("tags", [])
+            audio_quality = media_tags[-1] if media_tags else item_data.get("audioQuality", "")
 
             dur_str = f"{duration // 60}:{duration % 60:02d}" if duration else min_duration
 
