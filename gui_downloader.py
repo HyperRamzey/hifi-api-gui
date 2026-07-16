@@ -3,11 +3,13 @@
 import base64
 import json
 import logging
+import random
 import re
 import shutil
 import subprocess
 import sys
 import threading
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,6 +19,7 @@ from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QCloseEvent, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFrame,
@@ -107,6 +110,12 @@ def _config_file() -> Path:
 
 
 CONFIG_FILE = _config_file()
+
+
+def _delay():
+    """Random delay 50-350ms between API actions."""
+    time.sleep(random.uniform(0.05, 0.35))
+
 
 # Paths for auto-starting the hifi-api server
 _SCRIPT_DIR = _runtime_dir()
@@ -218,6 +227,28 @@ class Api:
         except Exception:
             return None
 
+    def get_lyrics(self, track_id: int) -> dict:
+        """Fetch lyrics for a track."""
+        with self._lock:
+            r = self.session.get(
+                f"{API_BASE}/lyrics/",
+                params={"id": str(track_id)},
+                timeout=10,
+            )
+        r.raise_for_status()
+        return r.json()
+
+    def get_track_info(self, track_id: int) -> dict:
+        """Fetch track metadata (bpm, copyright, isrc, explicit, etc.)."""
+        with self._lock:
+            r = self.session.get(
+                f"{API_BASE}/info/",
+                params={"id": str(track_id)},
+                timeout=10,
+            )
+        r.raise_for_status()
+        return r.json()
+
 
 # ─── DownloadTask ─────────────────────────────────────────────────────────────
 
@@ -239,6 +270,23 @@ class DownloadTask:
     filepath: str = ""
     audio_codec: str = ""
     _row_id: int = field(default=0, repr=False)
+    # Lyrics
+    lyrics_text: str = ""
+    lyrics_subtitles: str = ""
+    # Extended metadata
+    genres: str = ""
+    bpm: int | None = None
+    initial_key: str = ""
+    label: str = ""
+    copyright: str = ""
+    isrc: str = ""
+    explicit: bool = False
+    # Basic metadata (from /info/ endpoint)
+    track_number: int = 0
+    disc_number: int = 0
+    album_artist: str = ""
+    date: str = ""
+    url: str = ""
 
 
 # ─── Manifest Decoding ────────────────────────────────────────────────────────
@@ -367,6 +415,7 @@ class DownloadWorker(QObject):
         last_error = None
         used_fallback = False
         for attempt_fmt in [fmt] + fallbacks:
+            _delay()
             try:
                 resp = self.api.get_manifest(task.track_id, attempt_fmt)
             except Exception as e:
@@ -417,6 +466,55 @@ class DownloadWorker(QObject):
             except Exception:
                 pass  # Cover art is optional
 
+            # Fetch lyrics if enabled in config
+            mgr = getattr(self, "download_mgr", None)
+            if mgr is not None and (
+                getattr(mgr, "_lyrics_embed", False)
+                or getattr(mgr, "_lyrics_file", False)
+            ):
+                try:
+                    _delay()
+                    resp = self.api.get_lyrics(task.track_id)
+                    lyrics_data = resp.get("lyrics", {})
+                    task.lyrics_text = lyrics_data.get("lyricsBody", "") or ""
+                    task.lyrics_subtitles = lyrics_data.get("subtitles", "") or ""
+                except Exception:
+                    pass  # Lyrics are optional
+
+            # Fetch extended track metadata
+            try:
+                _delay()
+                track_info = self.api.get_track_info(task.track_id)
+                # /info/ returns metadata directly at data.* (not nested in attributes/meta)
+                meta = track_info.get("data", {})
+                if not isinstance(meta, dict):
+                    meta = {}
+                # Basic metadata
+                task.track_number = meta.get("trackNumber", 0) or 0
+                task.disc_number = meta.get("volumeNumber", 0) or 0
+                task.url = meta.get("url", "")
+                album = meta.get("album", {})
+                if isinstance(album, dict):
+                    task.album = album.get("title", task.album)
+                artist = meta.get("artist", {})
+                if isinstance(artist, dict):
+                    task.album_artist = artist.get("name", "")
+                # Extended metadata
+                task.bpm = meta.get("bpm")
+                task.copyright = meta.get("copyright", "")
+                task.isrc = meta.get("isrc", "")
+                task.explicit = bool(meta.get("explicit", False))
+                # key + keyScale combine to form the musical key
+                if meta.get("key"):
+                    ks = meta.get("keyScale", "")
+                    task.initial_key = f"{meta['key']} {ks}" if ks else meta["key"]
+                task.label = meta.get("label", "")
+                # Date from streamStartDate
+                if meta.get("streamStartDate"):
+                    task.date = meta["streamStartDate"][:4]  # year only
+            except Exception:
+                pass  # Extended metadata is optional
+
             return
 
         if last_error:
@@ -464,6 +562,7 @@ class DownloadWorker(QObject):
 
             # Download init segment if present
             if init_url:
+                _delay()
                 self.progress.emit(25, "Downloading init segment...", task.track_id)
                 with self.api._lock:
                     r = session.get(init_url, timeout=60)
@@ -472,6 +571,7 @@ class DownloadWorker(QObject):
                     f.write(r.content)
 
             # Download all media segments and append to combined file
+            _delay()
             self.progress.emit(25, "Downloading segments...", task.track_id)
             with open(combined_path, "ab") as f:
                 for i, url in enumerate(urls):
@@ -517,6 +617,17 @@ class DownloadWorker(QObject):
             # Embed cover art if available
             if task.cover_bytes:
                 self._embed_cover(filepath, task.cover_bytes)
+
+            # Embed extended metadata
+            self._embed_metadata(filepath, task)
+
+            # Embed/save lyrics if available
+            cfg = self._load_config()
+            if task.lyrics_text:
+                if cfg.get("lyrics_embed", False):
+                    self._embed_lyrics(filepath, task.lyrics_text, task.lyrics_subtitles)
+                if cfg.get("lyrics_file", False):
+                    self._save_lyrics_file(filepath.parent, task.lyrics_text)
 
             task.progress = 100.0
             task.filepath = str(filepath)  # type: ignore
@@ -579,6 +690,148 @@ class DownloadWorker(QObject):
         except Exception:
             pass  # Cover art embedding is optional
 
+    def _load_config(self) -> dict:
+        """Load config from the global config file."""
+        try:
+            return json.loads(CONFIG_FILE.read_text())
+        except Exception:
+            return {}
+
+    def _embed_metadata(self, filepath: Path, task: DownloadTask):
+        """Embed extended metadata (genres, bpm, label, isrc, etc.) into the audio file."""
+        try:
+            ext = filepath.suffix.lower()
+            if ext == ".flac":
+                self._embed_metadata_flac(filepath, task)
+            elif ext == ".m4a":
+                self._embed_metadata_mp4(filepath, task)
+        except Exception:
+            pass  # Metadata embedding is optional
+
+    def _embed_metadata_flac(self, filepath: Path, task: DownloadTask):
+        """Write metadata to a FLAC file using vorbis comments (basic + extended)."""
+        from mutagen.flac import FLAC
+
+        audio = FLAC(str(filepath))
+        if audio.tags is None:
+            audio.add_tags()
+        # Basic metadata
+        if task.title:
+            audio.tags["TITLE"] = task.title
+        if task.artist:
+            audio.tags["ARTIST"] = task.artist
+        if task.album:
+            audio.tags["ALBUM"] = task.album
+        if task.album_artist:
+            audio.tags["ALBUMARTIST"] = task.album_artist
+        if task.track_number:
+            audio.tags["TRACKNUMBER"] = str(task.track_number)
+        if task.disc_number:
+            audio.tags["DISCNUMBER"] = str(task.disc_number)
+        if task.date:
+            audio.tags["DATE"] = task.date
+        if task.url:
+            audio.tags["URL"] = task.url
+        # Extended metadata
+        if task.genres:
+            audio.tags["GENRE"] = task.genres
+        if task.bpm is not None:
+            audio.tags["BPM"] = str(task.bpm)
+        if task.initial_key:
+            audio.tags["INITIALKEY"] = task.initial_key
+        if task.label:
+            audio.tags["LABEL"] = task.label
+        if task.copyright:
+            audio.tags["COPYRIGHT"] = task.copyright
+        if task.isrc:
+            audio.tags["ISRC"] = task.isrc
+        audio.save()
+
+    def _embed_metadata_mp4(self, filepath: Path, task: DownloadTask):
+        """Write metadata to an M4A file using iTunes atoms (basic + extended)."""
+        from mutagen.mp4 import MP4
+
+        audio = MP4(str(filepath))
+        if audio.tags is None:
+            return
+        # Basic metadata
+        if task.title:
+            audio.tags["\xa9nam"] = task.title
+        if task.artist:
+            audio.tags["\xa9ART"] = task.artist
+        if task.album:
+            audio.tags["\xa9alb"] = task.album
+        if task.album_artist:
+            audio.tags["aART"] = task.album_artist
+        if task.track_number:
+            audio.tags["trkn"] = [[task.track_number, 1]]
+        if task.disc_number:
+            audio.tags["disk"] = [[task.disc_number, 1]]
+        if task.date:
+            audio.tags["\xa9day"] = task.date
+        if task.url:
+            audio.tags["purl"] = task.url
+        # Extended metadata
+        if task.genres:
+            audio.tags["\xa9gen"] = task.genres
+        if task.bpm is not None:
+            audio.tags["tmpo"] = [int(task.bpm)]
+        if task.initial_key:
+            audio.tags["----:com.apple.iTunes:INITIALKEY"] = task.initial_key.encode("utf-8")
+        if task.label:
+            audio.tags["----:com.apple.iTunes:LABEL"] = task.label.encode("utf-8")
+        if task.copyright:
+            audio.tags["cprt"] = task.copyright
+        if task.isrc:
+            audio.tags["isrc"] = task.isrc
+        if task.explicit:
+            audio.tags["rtng"] = [1]
+        audio.save()
+
+    def _embed_lyrics(self, filepath: Path, lyrics_text: str, subtitles_text: str):
+        """Embed lyrics into the audio file. Subtitles (synced) take precedence if available."""
+        try:
+            ext = filepath.suffix.lower()
+            if ext == ".flac":
+                from mutagen.flac import FLAC
+
+                audio = FLAC(str(filepath))
+                if subtitles_text:
+                    audio.tags["SUBTITLE"] = subtitles_text
+                if lyrics_text:
+                    audio.tags["LYRICS"] = lyrics_text
+                audio.save()
+            elif ext == ".m4a":
+                from mutagen.mp4 import MP4
+
+                audio = MP4(str(filepath))
+                if audio.tags is None:
+                    return
+                if subtitles_text:
+                    audio.tags["----:com.apple.iTunes:subtitles"] = subtitles_text.encode("utf-8")
+                if lyrics_text:
+                    audio.tags["\xa9lyr"] = lyrics_text
+                audio.save()
+        except Exception:
+            pass  # Lyrics embedding is optional
+
+    def _save_lyrics_file(self, directory: Path, lyrics_text: str):
+        """Save lyrics to a separate .lrc file next to the audio file."""
+        try:
+            stem = directory.stem if hasattr(directory, "stem") else directory.name
+            # Use parent dir's stem + a safe suffix
+            lrc_path = directory / f"{stem}.lrc"
+            # Avoid collision
+            i = 1
+            while lrc_path.exists():
+                lrc_path = directory / f"{stem}_{i}.lrc"
+                i += 1
+                if i > 100:
+                    return  # Safety limit
+            lrc_path.write_text(lyrics_text, encoding="utf-8")
+        except Exception:
+            pass  # Lyrics file saving is optional
+
 
 class DownloadManager(QObject):
     """Manages download queue and worker threads."""
@@ -588,11 +841,20 @@ class DownloadManager(QObject):
     task_failed = pyqtSignal(object)  # DownloadTask
     task_status_changed = pyqtSignal()  # Emitted when any task status changes
 
-    def __init__(self, api: Api, output_dir: Path, max_concurrent: int = 3):
+    def __init__(
+        self,
+        api: Api,
+        output_dir: Path,
+        max_concurrent: int = 3,
+        lyrics_embed: bool = False,
+        lyrics_file: bool = False,
+    ):
         super().__init__()
         self.api = api
         self.output_dir = output_dir
         self.max_concurrent = max_concurrent
+        self._lyrics_embed = lyrics_embed
+        self._lyrics_file = lyrics_file
         self.queue: list[DownloadTask] = []
         self.queue_lock = threading.Lock()
         self.active_threads: list[tuple[QThread, DownloadWorker]] = []
@@ -757,6 +1019,7 @@ class SearchWorker(QObject):
             if self.api is None:
                 self.search_error.emit("API not initialized")
                 return
+            _delay()
             items = self.api.search_tracks(query, limit=limit, offset=offset)
             self.results_ready.emit(items)
         except Exception as e:
@@ -776,6 +1039,9 @@ class MainWindow(QMainWindow):
         self.api = Api()
         self.output_dir = self._load_config().get("output_dir", str(Path.home() / "Music"))
         self.quality = self._load_config().get("quality", "FLAC")
+        cfg_lyrics = self._load_config()
+        self.lyrics_embed = cfg_lyrics.get("lyrics_embed", False)
+        self.lyrics_file = cfg_lyrics.get("lyrics_file", False)
         self.task_map: dict[int, DownloadTask] = {}  # track_id -> task
         self.result_rows: list[QTreeWidgetItem] = []  # track items in results tree
         self.queue_rows: list[tuple[QTreeWidgetItem, DownloadTask]] = []  # (item, task) in queue
@@ -797,7 +1063,12 @@ class MainWindow(QMainWindow):
         self.search_worker.search_error.connect(self._on_search_error)
         # Thread is started on first search, not at init
 
-        self.download_mgr = DownloadManager(self.api, Path(self.output_dir))
+        self.download_mgr = DownloadManager(
+            self.api,
+            Path(self.output_dir),
+            lyrics_embed=self.lyrics_embed,
+            lyrics_file=self.lyrics_file,
+        )
         self.download_mgr.progress.connect(self.on_download_progress)
         self.download_mgr.task_completed.connect(self._on_task_completed)
         self.download_mgr.task_failed.connect(self._on_task_failed)
@@ -831,10 +1102,18 @@ class MainWindow(QMainWindow):
                 {
                     "output_dir": self.output_dir,
                     "quality": self.quality,
+                    "lyrics_embed": self.lyrics_embed,
+                    "lyrics_file": self.lyrics_file,
                 },
                 indent=2,
             )
         )
+
+    def _save_lyrics_config(self):
+        """Save lyrics settings when checkboxes change."""
+        self.lyrics_embed = self.lyrics_embed_cb.isChecked()
+        self.lyrics_file = self.lyrics_file_cb.isChecked()
+        self._save_config()
 
     def _build_ui(self):
         """Build the complete UI."""
@@ -871,6 +1150,25 @@ class MainWindow(QMainWindow):
         self.quality_combo.currentIndexChanged.connect(self._on_quality_changed)
         top_layout.addWidget(self.quality_combo)
 
+        main_layout.addWidget(top_group)
+
+        # ── Lyrics settings ──
+        lyrics_group = QGroupBox("Lyrics")
+        lyrics_layout = QHBoxLayout(lyrics_group)
+
+        self.lyrics_embed_cb = QCheckBox("Embed lyrics in audio files")
+        self.lyrics_embed_cb.setChecked(self.lyrics_embed)
+        self.lyrics_embed_cb.stateChanged.connect(self._save_lyrics_config)
+        lyrics_layout.addWidget(self.lyrics_embed_cb)
+
+        self.lyrics_file_cb = QCheckBox("Save lyrics as .lrc file")
+        self.lyrics_file_cb.setChecked(self.lyrics_file)
+        self.lyrics_file_cb.stateChanged.connect(self._save_lyrics_config)
+        lyrics_layout.addWidget(self.lyrics_file_cb)
+
+        lyrics_layout.addStretch()
+        main_layout.addWidget(lyrics_group)
+
         # ── Splitter: results | queue ──
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
@@ -893,6 +1191,7 @@ class MainWindow(QMainWindow):
         self.results_tree.setColumnWidth(4, 110)
         self.results_tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
         self.results_tree.itemClicked.connect(self._on_result_clicked)
+        self.results_tree.customContextMenuRequested.connect(self._show_results_context_menu)
         if self.results_tree.header():
             self.results_tree.header().setSectionsClickable(True)
             self.results_tree.header().setSortIndicatorShown(True)
@@ -984,7 +1283,6 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 1)
 
-        main_layout.addWidget(top_group)
         main_layout.addWidget(splitter)
 
         # ── Bottom bar ──
@@ -1226,7 +1524,10 @@ class MainWindow(QMainWindow):
             album = item_data.get("album", {}).get("title", "Unknown")
             duration = item_data.get("duration", 0)
             min_duration = item_data.get("minDuration", "")
-            audio_quality = item_data.get("audioQuality", "")
+            # audioQuality is always the base quality; mediaMetadata.tags[-1] is the highest available
+            media_meta = item_data.get("mediaMetadata", {})
+            media_tags = media_meta.get("tags", [])
+            audio_quality = media_tags[-1] if media_tags else item_data.get("audioQuality", "")
 
             dur_str = f"{duration // 60}:{duration % 60:02d}" if duration else min_duration
 
@@ -1501,9 +1802,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Cover Art Error",
-                f"Failed to load cover art for this track.\n\n"
-                f"The API may be temporarily rate-limited.\n"
-                f"Click again to retry, or skip to another track.",
+                "Failed to load cover art for this track.\n\n"
+                "The API may be temporarily rate-limited.\n"
+                "Click again to retry, or skip to another track.",
             )
             return
         except Exception as e:
@@ -1708,6 +2009,143 @@ class MainWindow(QMainWindow):
                 if action == remove_action:
                     self._remove_from_queue(task, tree_item)
                 break
+
+    def _show_results_context_menu(self, position):
+        """Show context menu on search results right-click."""
+        item = self.results_tree.itemAt(position)
+        if not item:
+            return
+
+        track_id = item.data(0, Qt.ItemDataRole.UserRole)
+        if track_id is None:
+            return
+
+        task = self.task_map.get(track_id)
+        if task is None:
+            return
+
+        menu = QMenu(self)
+        lyrics_action = menu.addAction("View Lyrics")
+        details_action = menu.addAction("View Details")
+        vp = self.results_tree.viewport()
+        if vp:
+            action = menu.exec(vp.mapToGlobal(position))
+        else:
+            action = menu.exec(self.results_tree.mapToGlobal(position))
+        if action == lyrics_action:
+            self._show_lyrics_dialog(task)
+        elif action == details_action:
+            self._show_details_dialog(task)
+
+    def _show_lyrics_dialog(self, task: DownloadTask):
+        """Show lyrics for a track in a dialog (fetched on-demand)."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Lyrics – {task.title}")
+        dlg.resize(550, 450)
+        layout = QVBoxLayout(dlg)
+
+        # Loading indicator
+        loading_label = QLabel("Fetching lyrics…")
+        layout.addWidget(loading_label)
+
+        lyrics_edit = QTextEdit()
+        lyrics_edit.setReadOnly(True)
+        lyrics_edit.setPlaceholderText("Loading…")
+        lyrics_edit.setVisible(False)
+        layout.addWidget(lyrics_edit)
+
+        # Synced subtitles section (hidden until populated)
+        sub_label = QLabel("Synced Lyrics (LRC):")
+        sub_label.setStyleSheet("font-weight: bold; margin-top: 8px;")
+        sub_label.setVisible(False)
+        layout.addWidget(sub_label)
+        sub_edit = QTextEdit()
+        sub_edit.setReadOnly(True)
+        sub_edit.setMaximumHeight(150)
+        sub_edit.setVisible(False)
+        layout.addWidget(sub_edit)
+
+        close_btn = QPushButton("Close")
+        close_btn.setVisible(False)
+        close_btn.clicked.connect(dlg.close)
+        layout.addWidget(close_btn)
+
+        def _populate_lyrics(lyrics_text: str, subtitles_text: str):
+            """Called from main thread via QTimer."""
+            loading_label.setVisible(False)
+            if lyrics_text:
+                lyrics_edit.setVisible(True)
+                lyrics_edit.setPlainText(lyrics_text)
+            else:
+                lyrics_edit.setVisible(True)
+                lyrics_edit.setPlaceholderText("No lyrics available for this track.")
+            if subtitles_text:
+                sub_label.setVisible(True)
+                sub_edit.setVisible(True)
+                sub_edit.setPlainText(subtitles_text)
+            close_btn.setVisible(True)
+
+        # Fetch lyrics in a background thread
+        def _fetch():
+            try:
+                _delay()
+                resp = self.api.get_lyrics(task.track_id)
+                data = resp.get("lyrics", {})
+                task.lyrics_text = data.get("lyricsBody", "") or ""
+                task.lyrics_subtitles = data.get("subtitles", "") or ""
+            except Exception:
+                task.lyrics_text = ""
+                task.lyrics_subtitles = ""
+            QTimer.singleShot(0, lambda: _populate_lyrics(task.lyrics_text, task.lyrics_subtitles))
+
+        fetch_thread = QThread()
+
+        def _run():
+            _fetch()
+
+        fetch_thread.started.connect(_run)
+
+        fetch_thread.start()
+        dlg.exec()
+        if fetch_thread.isRunning():
+            fetch_thread.terminate()
+            fetch_thread.wait()
+
+    def _show_details_dialog(self, task: DownloadTask):
+        """Show extended metadata for a track."""
+        lines: list[str] = []
+        lines.append(f"Title:    {task.title}")
+        lines.append(f"Artist:   {task.artist}")
+        lines.append(f"Album:    {task.album}")
+        if task.genres:
+            lines.append(f"Genre:    {task.genres}")
+        if task.bpm is not None:
+            lines.append(f"BPM:      {task.bpm}")
+        if task.initial_key:
+            lines.append(f"Key:      {task.initial_key}")
+        if task.label:
+            lines.append(f"Label:    {task.label}")
+        if task.copyright:
+            lines.append(f"Copyright: {task.copyright}")
+        if task.isrc:
+            lines.append(f"ISRC:     {task.isrc}")
+        lines.append(f"Explicit: {'Yes' if task.explicit else 'No'}")
+        lines.append(f"Quality:  {task.quality}")
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Details – {task.title}")
+        dlg.resize(400, 350)
+        layout = QVBoxLayout(dlg)
+
+        info = QTextEdit()
+        info.setReadOnly(True)
+        info.setPlainText("\n".join(lines))
+        layout.addWidget(info)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.close)
+        layout.addWidget(close_btn)
+        dlg.exec()
 
     def _remove_from_queue(self, task: DownloadTask, tree_item: QTreeWidgetItem):
         """Remove a task from the queue."""

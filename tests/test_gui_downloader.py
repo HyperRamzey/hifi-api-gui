@@ -1454,3 +1454,332 @@ class TestDownloadManagerSequentialDispatch:
             # Simulate completion of task 5 → no more tasks to dispatch
             mgr._on_task_done(tasks[4])
             assert MockThread.call_count == 5  # no additional dispatch
+
+
+# ─── Metadata embedding tests ──────────────────────────────────────────────────
+
+
+def _create_test_flac(path: Path):
+    """Create a minimal valid FLAC file using ffmpeg. Returns the path."""
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi", "-i",
+            "anullsrc=r=44100:cl=stereo",
+            "-c:a", "flac", "-b:a", "128k", "-t", "1",
+            str(path),
+        ],
+        capture_output=True,
+        check=True,
+    )
+    return path
+
+
+def _create_test_m4a(path: Path):
+    """Create a minimal valid M4A file using ffmpeg. Returns the path."""
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi", "-i",
+            "anullsrc=r=44100:cl=stereo",
+            "-c:a", "aac", "-b:a", "128k", "-t", "1",
+            str(path),
+        ],
+        capture_output=True,
+        check=True,
+    )
+    return path
+
+
+class TestEmbedMetadata:
+    """Tests for FLAC and M4A metadata embedding."""
+
+    def _make_worker(self):
+        """Create a minimal DownloadWorker for metadata testing."""
+        worker = DownloadWorker.__new__(DownloadWorker)
+        from PyQt6.QtCore import QObject
+
+        QObject.__init__(worker)
+        worker.api = MagicMock()
+        worker.output_dir = Path("/tmp")
+        return worker
+
+    def test_flac_metadata_written(self, tmp_path: Path):
+        """_embed_metadata_flac writes basic + extended tags to a FLAC file."""
+        from mutagen.flac import FLAC
+
+        worker = self._make_worker()
+        flac_path = tmp_path / "test.flac"
+        _create_test_flac(flac_path)
+
+        task = DownloadTask(
+            track_id=1,
+            title="Test Track",
+            artist="Test Artist",
+            album="Test Album",
+            duration=180,
+        )
+        task.album_artist = "Album Artist"
+        task.track_number = 5
+        task.disc_number = 2
+        task.date = "2024"
+        task.url = "http://tidal.com/track/1"
+        task.bpm = 120
+        task.genres = "Electronic, Synthpop"
+        task.initial_key = "C Major"
+        task.label = "Test Label"
+        task.copyright = "(P) 2024 Test"
+        task.isrc = "USTEST123456"
+
+        worker._embed_metadata_flac(flac_path, task)
+
+        # Verify basic tags
+        audio = FLAC(str(flac_path))
+        assert audio.tags["TITLE"] == ["Test Track"]
+        assert audio.tags["ARTIST"] == ["Test Artist"]
+        assert audio.tags["ALBUM"] == ["Test Album"]
+        assert audio.tags["ALBUMARTIST"] == ["Album Artist"]
+        assert audio.tags["TRACKNUMBER"] == ["5"]
+        assert audio.tags["DISCNUMBER"] == ["2"]
+        assert audio.tags["DATE"] == ["2024"]
+        assert audio.tags["URL"] == ["http://tidal.com/track/1"]
+        # Verify extended tags
+        assert audio.tags["BPM"] == ["120"]
+        assert audio.tags["GENRE"] == ["Electronic, Synthpop"]
+        assert audio.tags["INITIALKEY"] == ["C Major"]
+        assert audio.tags["LABEL"] == ["Test Label"]
+        assert audio.tags["COPYRIGHT"] == ["(P) 2024 Test"]
+        assert audio.tags["ISRC"] == ["USTEST123456"]
+
+        flac_path.unlink()
+
+    def test_flac_empty_metadata_no_crash(self, tmp_path: Path):
+        """_embed_metadata_flac handles empty metadata gracefully."""
+        from mutagen.flac import FLAC
+
+        worker = self._make_worker()
+        flac_path = tmp_path / "test.flac"
+        _create_test_flac(flac_path)
+
+        task = DownloadTask(
+            track_id=1,
+            title="T",
+            artist="A",
+            album="Al",
+            duration=60,
+        )
+        worker._embed_metadata_flac(flac_path, task)
+
+        audio = FLAC(str(flac_path))
+        assert audio.tags is not None
+
+        flac_path.unlink()
+
+    def test_flac_adds_tags_to_file_without_tags(self, tmp_path: Path):
+        """_embed_metadata_flac creates tags on a file that has none."""
+        from mutagen.flac import FLAC
+
+        worker = self._make_worker()
+        flac_path = tmp_path / "test.flac"
+        _create_test_flac(flac_path)
+
+        # Remove all tags
+        flac = FLAC(str(flac_path))
+        flac.clear_pictures()
+        if flac.tags:
+            flac.tags.clear()
+            flac.save()
+        # Re-open to ensure clean state
+        flac = FLAC(str(flac_path))
+
+        task = DownloadTask(
+            track_id=1,
+            title="T",
+            artist="A",
+            album="Al",
+            duration=60,
+        )
+        task.bpm = 100
+        worker._embed_metadata_flac(flac_path, task)
+
+        audio = FLAC(str(flac_path))
+        assert audio.tags is not None
+        assert audio.tags["BPM"] == ["100"]
+
+        flac_path.unlink()
+
+    def test_mp4_metadata_written(self, tmp_path: Path):
+        """_embed_metadata_mp4 writes basic + extended tags to an M4A file."""
+        from mutagen.mp4 import MP4
+
+        worker = self._make_worker()
+        m4a_path = tmp_path / "test.m4a"
+        _create_test_m4a(m4a_path)
+
+        task = DownloadTask(
+            track_id=1,
+            title="Test Track",
+            artist="Test Artist",
+            album="Test Album",
+            duration=180,
+        )
+        task.album_artist = "Album Artist"
+        task.track_number = 7
+        task.disc_number = 1
+        task.date = "2023"
+        task.url = "http://tidal.com/track/99"
+        task.bpm = 128
+        task.genres = "Rock"
+        task.initial_key = "Am"
+        task.label = "Rock Records"
+        task.copyright = "(P) 2024 Rock"
+        task.isrc = "USROCK1234"
+        task.explicit = True
+
+        worker._embed_metadata_mp4(m4a_path, task)
+
+        # Verify basic tags
+        audio = MP4(str(m4a_path))
+        assert audio.tags["\xa9nam"] == ["Test Track"]
+        assert audio.tags["\xa9ART"] == ["Test Artist"]
+        assert audio.tags["\xa9alb"] == ["Test Album"]
+        assert audio.tags["aART"] == ["Album Artist"]
+        assert audio.tags["trkn"] == [(7, 1)]
+        assert audio.tags["disk"] == [(1, 1)]
+        assert audio.tags["\xa9day"] == ["2023"]
+        assert audio.tags["purl"] == ["http://tidal.com/track/99"]
+        # Verify extended tags
+        assert audio.tags["tmpo"] == [128]
+        assert audio.tags["\xa9gen"] == ["Rock"]
+        assert audio.tags["----:com.apple.iTunes:INITIALKEY"] == [b"Am"]
+        assert audio.tags["----:com.apple.iTunes:LABEL"] == [b"Rock Records"]
+        assert audio.tags["cprt"] == ["(P) 2024 Rock"]
+        assert audio.tags["isrc"] == ["USROCK1234"]
+        assert audio.tags["rtng"] == [1]
+
+        m4a_path.unlink()
+
+    def test_mp4_empty_metadata_no_crash(self, tmp_path: Path):
+        """_embed_metadata_mp4 handles empty metadata gracefully."""
+        from mutagen.mp4 import MP4
+
+        worker = self._make_worker()
+        m4a_path = tmp_path / "test.m4a"
+        _create_test_m4a(m4a_path)
+
+        task = DownloadTask(
+            track_id=1,
+            title="T",
+            artist="A",
+            album="Al",
+            duration=60,
+        )
+        worker._embed_metadata_mp4(m4a_path, task)
+
+        audio = MP4(str(m4a_path))
+        assert audio.tags is not None
+
+        m4a_path.unlink()
+
+    def test_embed_metadata_dispatches_flac(self, tmp_path: Path):
+        """_embed_metadata calls _embed_metadata_flac for .flac files."""
+        flac_path = tmp_path / "test.flac"
+        _create_test_flac(flac_path)
+
+        worker = self._make_worker()
+        task = DownloadTask(
+            track_id=1, title="T", artist="A", album="Al", duration=60
+        )
+        task.bpm = 99
+
+        with patch.object(worker, "_embed_metadata_flac") as mock_flac:
+            with patch.object(worker, "_embed_metadata_mp4") as mock_mp4:
+                worker._embed_metadata(flac_path, task)
+
+        mock_flac.assert_called_once_with(flac_path, task)
+        mock_mp4.assert_not_called()
+
+        flac_path.unlink()
+
+    def test_embed_metadata_dispatches_mp4(self, tmp_path: Path):
+        """_embed_metadata calls _embed_metadata_mp4 for .m4a files."""
+        m4a_path = tmp_path / "test.m4a"
+        _create_test_m4a(m4a_path)
+
+        worker = self._make_worker()
+        task = DownloadTask(
+            track_id=1, title="T", artist="A", album="Al", duration=60
+        )
+        task.bpm = 99
+
+        with patch.object(worker, "_embed_metadata_flac") as mock_flac:
+            with patch.object(worker, "_embed_metadata_mp4") as mock_mp4:
+                worker._embed_metadata(m4a_path, task)
+
+        mock_mp4.assert_called_once_with(m4a_path, task)
+        mock_flac.assert_not_called()
+
+        m4a_path.unlink()
+
+
+# ─── API get_track_info tests ──────────────────────────────────────────────────
+
+
+class TestApiGetTrackInfo:
+    """Tests for Api.get_track_info using pytest-httpserver."""
+
+    def _make_api(self, http_server: HTTPServer) -> tuple[Api, str]:
+        """Create Api instance pointing at test server."""
+        a = Api()
+        a.session.headers["User-Agent"] = "test"
+        import gui_downloader
+
+        original = gui_downloader.API_BASE
+        gui_downloader.API_BASE = f"http://127.0.0.1:{http_server.port}"
+        return a, original
+
+    def _restore_base(self, original: str):
+        import gui_downloader
+
+        gui_downloader.API_BASE = original
+
+    def test_get_track_info_returns_metadata(self, http_server: HTTPServer):
+        """get_track_info returns track metadata from /info/ endpoint."""
+        info_resp = {
+            "version": "2.10",
+            "data": {
+                "id": 1781887,
+                "title": "Billie Jean",
+                "bpm": 117,
+                "copyright": "(P) 1982 MJJ Productions",
+                "isrc": "USSM19902991",
+                "explicit": False,
+                "key": "G",
+                "keyScale": "MINOR",
+            },
+        }
+        http_server.expect_request("/info/").respond_with_json(info_resp)
+
+        api, orig = self._make_api(http_server)
+        try:
+            result = api.get_track_info(1781887)
+            assert result["data"]["bpm"] == 117
+            assert result["data"]["copyright"] == "(P) 1982 MJJ Productions"
+            assert result["data"]["isrc"] == "USSM19902991"
+            assert result["data"]["key"] == "G"
+        finally:
+            self._restore_base(orig)
+
+    def test_get_track_info_calls_correct_endpoint(self, http_server: HTTPServer):
+        """get_track_info hits /info/ with correct track ID, not /track/."""
+        info_resp = {"version": "2.10", "data": {"id": 999, "title": "Test"}}
+        http_server.expect_request("/info/").respond_with_json(info_resp)
+        # If it hits /track/ instead, that request will 404
+        http_server.expect_request("/track/").respond_with_json(
+            {"error": "should not be called"}, status=404
+        )
+
+        api, orig = self._make_api(http_server)
+        try:
+            result = api.get_track_info(999)
+            assert result["data"]["id"] == 999
+        finally:
+            self._restore_base(orig)
